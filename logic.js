@@ -3,7 +3,7 @@ class Bad extends Error {}
 const bad = c => new Bad(c);
 const nd = l => l * l * 120 + 80;
 const lvOf = xp => { let x = xp || 0, l = 1; while (x >= nd(l)) { x -= nd(l); l++; } return l; };
-const WK = 168 * 36e5, DAY = 864e5, MAX_RATE = 60, MAX_RUN_SCORE = 200000, MAX_REVIVES = 3;
+const WK = 168 * 36e5, DAY = 864e5;
 const boostOf = (st, now) => (st.bs && now < st.bs.u ? st.bs.m : 0);
 const pay = (st, n) => { if ((st.coins || 0) < n) throw bad('no_coins'); st.coins -= n; };
 
@@ -29,19 +29,36 @@ function spin(cat, st, now, r) {
   let x = r * 100, i = 0; while (i < cat.wp.length - 1 && x >= cat.ww[i]) { x -= cat.ww[i]; i++; }
   st.coins = (st.coins || 0) + cat.wp[i]; st.wt = now + DAY; return i;
 }
-function runEnd(st, run, score, now) {
-  const el = (now - run.t0) / 1000, cap = Math.min(Math.floor(el * MAX_RATE + 500), MAX_RUN_SCORE);
+const MAX_RATE = 30, MAX_RUN_SCORE = 30000, MIN_RUN_SEC = 8, DAY_CAP = 6000, BAG_COINS = 5, BAG_EVERY = 6, FREE_REVIVES = 1, MAX_REVIVES_TOTAL = 3;
+// سقف ما يُكسب من الجولات في 24 ساعة (يمنع مزارع النقاط والأكياس)
+function dayRoom(st, now) { if (now > (st.rcT || 0)) { st.rcT = now + DAY; st.rcDay = 0; } return Math.max(0, DAY_CAP - (st.rcDay || 0)); }
+function runEnd(st, run, score, now, bags) {
+  const el = (now - run.t0) / 1000, ok = el >= MIN_RUN_SEC;
+  const cap = ok ? Math.min(Math.floor(el * MAX_RATE) + 50, MAX_RUN_SCORE) : 0;
   const sc = Math.max(0, Math.min(Math.floor(+score || 0), cap)), delta = Math.max(0, sc - run.paid);
   run.paid += delta;
-  const l0 = lvOf(st.xp), co = Math.floor(delta / 4), xp = Math.round(delta * (1 + boostOf(st, now) * 1.25));
-  st.coins = (st.coins || 0) + co; st.xp = (st.xp || 0) + xp; st.tot = (st.tot || 0) + delta;
-  const l1 = lvOf(st.xp), bonus = 50 * (l1 - l0); st.coins += bonus;
+  const bagMax = ok ? Math.floor(el / BAG_EVERY) + 2 : 0, nb = Math.max(0, Math.min(Math.floor(+bags || 0), bagMax) - (run.bags || 0));
+  run.bags = (run.bags || 0) + nb;
+  const l0 = lvOf(st.xp), co = Math.floor(delta / 4), bagCo = nb * BAG_COINS, xp = Math.round(delta * (1 + boostOf(st, now) * 1.25));
+  st.xp = (st.xp || 0) + xp; st.tot = (st.tot || 0) + delta;
+  const l1 = lvOf(st.xp), bonus = 50 * (l1 - l0);
+  const room = dayRoom(st, now), add = Math.min(co + bagCo + bonus, room);
+  st.rcDay = (st.rcDay || 0) + add; st.coins = (st.coins || 0) + add;
   const record = sc > (st.best || 0); if (record) st.best = sc;
-  run.lastCo = co; run.bonusUsed = false;
-  return { score: sc, coins: co, xp, levelUp: l1 > l0 ? l1 : 0, bonus, record };
+  run.lastCo = Math.min(co, add); run.bonusUsed = false;
+  return { score: sc, coins: co, bagCo, xp, levelUp: l1 > l0 ? l1 : 0, bonus, record, capped: add < co + bagCo + bonus };
 }
-function runBonus(st, run) { if (!run.lastCo || run.bonusUsed) throw bad('no_bonus'); st.coins = (st.coins || 0) + run.lastCo; run.bonusUsed = true; }
-function runRevive(st, run, free) { if ((run.revives || 0) >= MAX_REVIVES) throw bad('max_revives'); if (!free) pay(st, 100); run.revives = (run.revives || 0) + 1; }
+function runBonus(st, run, now) {
+  if (!run.lastCo || run.bonusUsed) throw bad('no_bonus');
+  const add = Math.min(run.lastCo, dayRoom(st, now || Date.now()));
+  st.rcDay = (st.rcDay || 0) + add; st.coins = (st.coins || 0) + add; run.bonusUsed = true;
+}
+function runRevive(st, run, free) {
+  if ((run.revives || 0) >= MAX_REVIVES_TOTAL) throw bad('max_revives');
+  if (free) { if ((run.freeUsed || 0) >= FREE_REVIVES) throw bad('max_free'); run.freeUsed = (run.freeUsed || 0) + 1; }
+  else pay(st, 100);
+  run.revives = (run.revives || 0) + 1;
+}
 function prefs(cat, st, b) {
   if (typeof b.flag === 'string' && cat.flags.includes(b.flag)) st.flag = b.flag;
   if (typeof b.av === 'string') st.av = b.av.slice(0, 4);
@@ -55,7 +72,7 @@ function deliver(cat, st, o) {
   if (o.kind === 'coins') st.coins = (st.coins || 0) + o.item;
   else if (o.kind === 'offer') {
     const of = cat.offers[o.item]; if (!of) throw bad('bad_item');
-    st.ob = st.ob || []; if (!st.ob.includes(o.item)) st.ob.push(o.item);
+    st.ob = st.ob || []; if (st.ob.includes(o.item)) return false; st.ob.push(o.item);
     st.own = st.own || [0]; of.sk.forEach(i => { if (i >= 0 && !st.own.includes(i)) st.own.push(i); });
     st.coins = (st.coins || 0) + of.c; st.gown = st.gown || ['🪦']; of.g.forEach(e => { if (!st.gown.includes(e)) st.gown.push(e); });
   } else throw bad('bad_item');

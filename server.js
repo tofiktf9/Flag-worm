@@ -1,14 +1,17 @@
 const express = require('express'), crypto = require('crypto'), path = require('path'), { Pool } = require('pg');
 const L = require('./logic'), CAT = require('./catalog.json');
 const DB = process.env.DATABASE_URL;
-const pool = new Pool({ connectionString: DB, ssl: DB && !/localhost|127\.0\.0\.1/.test(DB) ? { rejectUnauthorized: false } : false });
+const wantSsl = process.env.PGSSL ? process.env.PGSSL === '1' : !!DB && !/localhost|127\.0\.0\.1/.test(DB);
+const mkPool = ssl => new Pool({ connectionString: DB, ssl: ssl ? { rejectUnauthorized: false } : false });
+let pool = mkPool(wantSsl);
 const q = (t, p) => pool.query(t, p);
 const app = express();
 app.set('trust proxy', 1);
+app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'SAMEORIGIN', 'Referrer-Policy': 'no-referrer', 'Strict-Transport-Security': 'max-age=15552000' }); next(); });
 app.use(express.json({ limit: '1mb', verify: (req, res, buf) => { req.raw = buf; } }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-async function init() {
+async function init0() {
   await q(`create table if not exists users(
     id serial primary key, name text not null, name_lower text unique not null, email text unique,
     salt text not null, hash text not null, state jsonb not null default '{}', upd bigint not null default 0, created timestamptz default now());
@@ -17,12 +20,15 @@ async function init() {
   alter table orders add column if not exists provider text; alter table orders add column if not exists usd_cents int;
   create table if not exists codes(code text primary key, coins int not null, used_by int, used_at timestamptz, created_by int, created timestamptz default now());`);
 }
+async function init() { // لو السيرفر ما يدعم SSL (اتصال داخلي) نعيد المحاولة بدونه
+  try { await init0(); } catch (e) { if (wantSsl && /does not support SSL/i.test(e.message)) { pool = mkPool(false); await init0(); } else throw e; }
+}
 // معالج للأخطاء: يمرّر next (مهم للـ middleware) ويحوّل أخطاء المنطق إلى 400
 const w = f => (req, res, next) => f(req, res, next).catch(e => {
   if (e instanceof L.Bad) return res.status(400).json({ error: e.message });
   console.error(e); res.status(500).json({ error: 'server' });
 });
-const hash = (p, s) => crypto.scryptSync(p, s, 64).toString('hex');
+const hash = (p, s) => new Promise((ok, no) => crypto.scrypt(p, s, 64, (e, k) => e ? no(e) : ok(k.toString('hex')))); // غير متزامن: ما يوقف السيرفر
 const sameSig = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const rl = new Map();
 const guard = (max, ms = 60000) => (req, res, next) => {
@@ -32,11 +38,13 @@ const guard = (max, ms = 60000) => (req, res, next) => {
 };
 const authm = w(async (req, res, next) => {
   const t = (req.headers.authorization || '').slice(7);
-  const r = t && await q('select u.* from sessions s join users u on u.id=s.user_id where s.token=$1', [t]);
+  const r = t && await q('select u.* from sessions s join users u on u.id=s.user_id where s.token=$1 and s.created > now() - interval \'30 days\'', [t]);
   if (!r || !r.rows[0]) return res.status(401).json({ error: 'auth' });
   req.u = r.rows[0]; next();
 });
 const newSession = async uid => { const t = crypto.randomBytes(32).toString('hex'); await q('insert into sessions(token,user_id) values($1,$2)', [t, uid]); return t; };
+const OWNER = (process.env.OWNER_USER || '').trim().toLowerCase(); // اسم حساب المالك (يظهر له تبويب الأكواد)
+const isOwner = u => !!OWNER && u.name_lower === OWNER;
 const DEF = () => ({ flag: 'DZ', skin: 0, own: [0], coins: 100, xp: 0, best: 0, tot: 0 });
 
 // تحديث حالة اللاعب داخل معاملة مقفولة (يمنع السباق بين الطلبات)
@@ -61,25 +69,30 @@ app.post('/api/register', guard(10), w(async (req, res) => {
   const n = String(name).trim(), e = String(email).trim().toLowerCase();
   if (!/^[\p{L}\p{N}_ ]{2,12}$/u.test(n) || n.startsWith('__')) return res.status(400).json({ error: 'bad_name' });
   if (String(password).length < 6 || String(password).length > 100) return res.status(400).json({ error: 'bad_password' });
-  if (e && !/^\S+@\S+\.\S+$/.test(e)) return res.status(400).json({ error: 'bad_email' });
+  if (e && (e.length > 100 || !/^\S+@\S+\.\S+$/.test(e))) return res.status(400).json({ error: 'bad_email' });
   const salt = crypto.randomBytes(16).toString('hex');
   try {
-    const r = await q('insert into users(name,name_lower,email,salt,hash,state) values($1,$2,$3,$4,$5,$6) returning id', [n, n.toLowerCase(), e || null, salt, hash(password, salt), DEF()]);
+    const r = await q('insert into users(name,name_lower,email,salt,hash,state) values($1,$2,$3,$4,$5,$6) returning id', [n, n.toLowerCase(), e || null, salt, await hash(password, salt), DEF()]);
     res.json({ token: await newSession(r.rows[0].id), name: n, state: DEF() });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: /email/.test(err.detail || '') ? 'email_taken' : 'name_taken' });
     throw err;
   }
 }));
+const fails = new Map(); // محاولات الدخول الفاشلة لكل حساب (يمنع تخمين كلمة السر)
 app.post('/api/login', guard(10), w(async (req, res) => {
   const { name = '', password = '' } = req.body || {};
-  const k = String(name).trim().toLowerCase();
+  const k = String(name).trim().toLowerCase().slice(0, 100), f = (fails.get(k) || []).filter(t => Date.now() - t < 9e5);
+  if (f.length >= 8) return res.status(429).json({ error: 'rate' });
   const u = (await q('select * from users where name_lower=$1 or email=$1', [k])).rows[0];
-  const ok = u && sameSig(hash(String(password), u.salt), u.hash);
-  if (!ok) return res.status(401).json({ error: 'bad_login' });
-  res.json({ token: await newSession(u.id), name: u.name, state: u.state });
+  const hh = await hash(String(password).slice(0, 100), u ? u.salt : '0'.repeat(32)); // نفس الوقت حتى لو الحساب غير موجود
+  if (!u || !sameSig(hh, u.hash)) { f.push(Date.now()); fails.set(k, f); if (fails.size > 20000) fails.clear(); return res.status(401).json({ error: 'bad_login' }); }
+  fails.delete(k);
+  await q("delete from sessions where created < now() - interval '30 days'");
+  res.json({ token: await newSession(u.id), name: u.name, state: u.state, owner: isOwner(u) });
 }));
-app.get('/api/me', authm, (req, res) => res.json({ name: req.u.name, state: req.u.state, now: Date.now() }));
+app.post('/api/logout', authm, w(async (req, res) => { await q('delete from sessions where token=$1', [(req.headers.authorization || '').slice(7)]); res.json({ ok: 1 }); }));
+app.get('/api/me', authm, (req, res) => res.json({ name: req.u.name, state: req.u.state, now: Date.now(), owner: isOwner(req.u) }));
 
 // ===== الاقتصاد: كله هنا في السيرفر (العميل ما يقدر يعدّل العملات أو المشتريات) =====
 app.put('/api/prefs', ...act(30, (st, req) => { L.prefs(CAT, st, req.body || {}); }));
@@ -96,13 +109,17 @@ app.post('/api/run/start', ...act(30, (st, req) => {
   RUNS.set(id, { uid: req.u.id, t0: Date.now(), paid: 0, revives: 0, lastCo: 0, bonusUsed: true });
   return { run: id };
 }));
-app.post('/api/run/end', ...act(60, (st, req) => ({ reward: L.runEnd(st, runOf(req), (req.body || {}).score, Date.now()) })));
+app.post('/api/run/end', ...act(60, (st, req) => ({ reward: L.runEnd(st, runOf(req), (req.body || {}).score, Date.now(), (req.body || {}).bags) })));
 app.post('/api/run/revive', ...act(30, (st, req) => { L.runRevive(st, runOf(req), !!(req.body || {}).free); }));
-app.post('/api/run/bonus', ...act(30, (st, req) => { L.runBonus(st, runOf(req)); }));
+app.post('/api/run/bonus', ...act(30, (st, req) => { L.runBonus(st, runOf(req), Date.now()); }));
 
+let LBC = { t: 0, rows: [] };
 app.get('/api/leaderboard', w(async (_, res) => {
-  const r = await q(`select name, state->>'flag' as flag, state->>'av' as av, coalesce((state->>'tot')::bigint,0) as total from users order by total desc limit 50`);
-  res.json({ rows: r.rows.map(x => ({ ...x, total: Number(x.total) })) });
+  if (Date.now() - LBC.t > 10000) {
+    const r = await q(`select name, state->>'flag' as flag, state->>'av' as av, coalesce((state->>'tot')::bigint,0) as total from users order by total desc limit 50`);
+    LBC = { t: Date.now(), rows: r.rows.map(x => ({ ...x, total: Number(x.total) })) };
+  }
+  res.json({ rows: LBC.rows });
 }));
 
 // رموز الهدية: استعمال مرة وحدة (الإنشاء المدفوع معطّل في الإنتاج)
@@ -127,6 +144,21 @@ app.post('/api/admin/code', guard(10), w(async (req, res) => {
   const codes = [];
   for (let i = 0; i < n; i++) { const c = 'FREE-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6); await q('insert into codes(code,coins) values($1,$2)', [c, coins]); codes.push(c); }
   res.json({ codes });
+}));
+
+// ===== لوحة المالك: حساب المالك (OWNER_USER) + مفتاح الأدمن (ADMIN_KEY) معاً =====
+const ownerOnly = (req, res, next) => (isOwner(req.u) && process.env.ADMIN_KEY && sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) ? next() : res.status(403).json({ error: 'forbidden' });
+const AMOUNTS = [50, 100, 200, 500, 1000, 2000, 5000];
+app.post('/api/owner/code', authm, ownerOnly, guard(30), w(async (req, res) => {
+  const coins = +(req.body || {}).coins, n = Math.min(Math.max(+(req.body || {}).count || 1, 1), 50);
+  if (!AMOUNTS.includes(coins)) return res.status(400).json({ error: 'bad_amount' });
+  const codes = [];
+  for (let i = 0; i < n; i++) { const c = 'GIFT-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [c, coins, req.u.id]); codes.push(c); }
+  res.json({ codes });
+}));
+app.get('/api/owner/codes', authm, ownerOnly, guard(60), w(async (req, res) => {
+  const r = await q('select c.code, c.coins, c.created, u.name as used_name from codes c left join users u on u.id=c.used_by order by c.created desc limit 200');
+  res.json({ codes: r.rows });
 }));
 
 // ===== الدفع: Chargily (بطاقات جزائرية) + Lemon Squeezy (بطاقات دولية / PayPal) =====

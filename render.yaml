@@ -31,8 +31,12 @@ services:
         value: "1"
       - key: ADMIN_KEY
         sync: false
+      - key: OWNER_USER
+        sync: false
       - key: DZD_PER_USD
         value: "135"
+# تنبيه مهم: قاعدة Render المجانية تنتهي بعد 30 يوم (ثم 14 يوم مهلة) وبعدها تُحذف مع كل الحسابات، وما فيها نسخ احتياطي.
+# للنشر الحقيقي رقّها لخطة مدفوعة من لوحة Render (أو استخدم قاعدة PostgreSQL خارجية دائمة) قبل ما يسجّل ناس.
 databases:
   - name: flag-worm-db
     plan: free
