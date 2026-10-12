@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: flag-worm
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: flag-worm-db
+          property: connectionString
+      - key: ALLOW_TEST_PURCHASES
+        value: "0"
+      - key: CHARGILY_SECRET_KEY
+        sync: false
+      - key: CHARGILY_MODE
+        value: test
+      - key: PUBLIC_URL
+        sync: false
+      - key: LEMONSQUEEZY_API_KEY
+        sync: false
+      - key: LEMONSQUEEZY_STORE_ID
+        sync: false
+      - key: LEMONSQUEEZY_VARIANT_ID
+        sync: false
+      - key: LEMONSQUEEZY_WEBHOOK_SECRET
+        sync: false
+      - key: LEMONSQUEEZY_TEST_MODE
+        value: "1"
+      - key: ADMIN_KEY
+        sync: false
+      - key: DZD_PER_USD
+        value: "135"
+databases:
+  - name: flag-worm-db
+    plan: free
