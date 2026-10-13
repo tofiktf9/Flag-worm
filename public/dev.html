@@ -1,0 +1,22 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>لوحة المطوّر – توليد الأكواد</title>
+<style>body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#14213d;color:#f4f1ff;padding:16px}.w{max-width:760px;margin:auto}.card{background:#1f2f55;border-radius:16px;padding:16px;margin-bottom:14px}h1{margin:6px 0 14px}label{display:block;margin:10px 0 4px;color:#9fb0d6;font-size:14px}input,select,textarea{width:100%;box-sizing:border-box;font:inherit;font-size:17px;padding:10px;border-radius:10px;border:2px solid #51608a;background:#0f1830;color:#f4f1ff}textarea{direction:ltr;font-family:monospace;min-height:180px}.row{display:flex;gap:10px}.row>*{flex:1}button{font:inherit;font-weight:800;border:0;border-radius:12px;padding:13px;cursor:pointer;background:#fca311;color:#14213d;font-size:18px;width:100%;margin-top:12px}button.s{background:#2ec4b6;color:#06231f;width:auto;font-size:15px;padding:9px 14px;margin:8px 6px 0 0}table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px;border-bottom:1px solid #2b3d6b;text-align:start}td.c{direction:ltr;font-family:monospace}#msg{min-height:24px;margin-top:8px;color:#ffd166;font-weight:700}</style></head><body><div class="w">
+<h1>👑 لوحة المطوّر: توليد أكواد الهدية</h1>
+<div class="card"><label for="key">مفتاح الأدمن (ADMIN_KEY)</label><input id="key" type="password" autocomplete="off" placeholder="المفتاح السري">
+<div class="row"><div><label for="amt">الكمية (عملات)</label><select id="amt"></select></div><div><label for="cus">أو مبلغ مخصص (1 – 100000)</label><input id="cus" type="number" min="1" max="100000" placeholder="اختياري"></div></div>
+<label for="cnt">عدد الأكواد (1 – 100)</label><select id="cnt"></select>
+<button id="go">⚡ توليد الأكواد</button><div id="msg" role="status"></div></div>
+<div class="card" id="out" style="display:none"><b>الأكواد الجديدة (كل كود يعمل مرة وحدة في اللعبة):</b><textarea id="codes" readonly></textarea><button class="s" id="cp">نسخ الكل</button><button class="s" id="dl">تحميل .txt</button></div>
+<div class="card"><b>آخر الأكواد</b> <button class="s" id="rf" style="float:left;margin:0">تحديث</button><div id="list" style="margin-top:10px;overflow:auto"></div></div></div>
+<script>
+const $=s=>document.querySelector(s),E=s=>String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+[500,1000,5000,10000,15000,20000,25000,30000,40000,50000,60000,70000,80000,90000,100000].forEach(a=>$('#amt').insertAdjacentHTML('beforeend','<option value="'+a+'">'+a.toLocaleString('en')+' عملة</option>'));
+for(let i=1;i<=100;i++)$('#cnt').insertAdjacentHTML('beforeend','<option>'+i+'</option>');
+try{$('#key').value=sessionStorage.getItem('dk')||''}catch(e){}
+const msg=t=>$('#msg').textContent=t;
+async function api(p,m,b){const r=await fetch(p,{method:m||'GET',headers:{'Content-Type':'application/json','x-admin-key':$('#key').value},body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(r.status==403)throw new Error('المفتاح غير صحيح');if(!r.ok)throw new Error(j.error||'خطأ');return j}
+async function list(){try{const j=await api('/api/admin/codes');$('#list').innerHTML='<table><tr><th>الكود</th><th>العملات</th><th>الحالة</th></tr>'+j.codes.map(c=>'<tr><td class="c">'+E(c.code)+'</td><td>'+c.coins+'</td><td>'+(c.used_name?'مستعمل ('+E(c.used_name)+')':'متاح')+'</td></tr>').join('')+'</table>'}catch(e){$('#list').textContent=e.message}}
+$('#go').onclick=async()=>{try{sessionStorage.setItem('dk',$('#key').value)}catch(e){}const coins=+$('#cus').value||+$('#amt').value;msg('...');try{const j=await api('/api/admin/code','POST',{coins,count:+$('#cnt').value});$('#codes').value=j.codes.join('\n');$('#out').style.display='block';msg('تم توليد '+j.codes.length+' كود × '+coins+' عملة');list()}catch(e){msg(e.message)}};
+$('#cp').onclick=()=>{navigator.clipboard.writeText($('#codes').value).then(()=>msg('تم النسخ'))};
+$('#dl').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([$('#codes').value],{type:'text/plain'}));a.download='codes.txt';a.click()};
+$('#rf').onclick=list;if($('#key').value)list();
+</script></body></html>

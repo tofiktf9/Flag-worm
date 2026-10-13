@@ -127,7 +127,7 @@ app.post('/api/code/create', authm, guard(10), w(async (req, res) => {
   if (process.env.ALLOW_TEST_PURCHASES !== '1') return res.status(403).json({ error: 'payments_disabled' });
   const coins = [50, 100, 200, 500, 1000, 2000, 5000].includes(+req.body.coins) ? +req.body.coins : 0;
   if (!coins) return res.status(400).json({ error: 'bad_amount' });
-  const code = 'GIFT-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
+  const code = 'GIFT-' + crypto.randomBytes(5).toString('hex').toUpperCase();
   await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [code, coins, req.u.id]);
   res.json({ code });
 }));
@@ -139,10 +139,10 @@ app.post('/api/redeem', ...act(10, async (st, req) => {
 }));
 app.post('/api/admin/code', guard(10), w(async (req, res) => {
   if (!process.env.ADMIN_KEY || !sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) return res.sendStatus(403);
-  const coins = +(req.body || {}).coins, n = Math.min(+(req.body || {}).count || 1, 100);
+  const coins = Math.floor(+(req.body || {}).coins), n = Math.min(Math.max(Math.floor(+(req.body || {}).count) || 1, 1), 100);
   if (!(coins > 0 && coins <= 100000)) return res.status(400).json({ error: 'bad_amount' });
   const codes = [];
-  for (let i = 0; i < n; i++) { const c = 'FREE-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6); await q('insert into codes(code,coins) values($1,$2)', [c, coins]); codes.push(c); }
+  for (let i = 0; i < n; i++) { const c = 'FREE-' + crypto.randomBytes(5).toString('hex').toUpperCase(); await q('insert into codes(code,coins) values($1,$2)', [c, coins]); codes.push(c); }
   res.json({ codes });
 }));
 
@@ -153,11 +153,17 @@ app.post('/api/owner/code', authm, ownerOnly, guard(30), w(async (req, res) => {
   const coins = +(req.body || {}).coins, n = Math.min(Math.max(+(req.body || {}).count || 1, 1), 50);
   if (!AMOUNTS.includes(coins)) return res.status(400).json({ error: 'bad_amount' });
   const codes = [];
-  for (let i = 0; i < n; i++) { const c = 'GIFT-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [c, coins, req.u.id]); codes.push(c); }
+  for (let i = 0; i < n; i++) { const c = 'GIFT-' + crypto.randomBytes(5).toString('hex').toUpperCase(); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [c, coins, req.u.id]); codes.push(c); }
   res.json({ codes });
 }));
 app.get('/api/owner/codes', authm, ownerOnly, guard(60), w(async (req, res) => {
   const r = await q('select c.code, c.coins, c.created, u.name as used_name from codes c left join users u on u.id=c.used_by order by c.created desc limit 200');
+  res.json({ codes: r.rows });
+}));
+
+app.get('/api/admin/codes', guard(30), w(async (req, res) => {
+  if (!process.env.ADMIN_KEY || !sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) return res.sendStatus(403);
+  const r = await q('select c.code, c.coins, c.created, u.name as used_name from codes c left join users u on u.id=c.used_by order by c.created desc limit 500');
   res.json({ codes: r.rows });
 }));
 
@@ -168,7 +174,7 @@ const LK = process.env.LEMONSQUEEZY_API_KEY, LS_STORE = process.env.LEMONSQUEEZY
 const RATE = +process.env.DZD_PER_USD || 135, BASE = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const have = { cg: !!(CK && BASE), ls: !!(LK && LS_STORE && LS_VARIANT && LS_SECRET && BASE) };
 const PRICE = { // الأسعار بالدولار (مصدر الحقيقة هنا في السيرفر)
-  coins: { 300: .99, 700: 2.49, 1200: 4.99, 2000: 7.99, 5000: 14.99 },
+  coins: { 1500: .99, 3500: 2.49, 6500: 4.99, 9500: 7.99, 15000: 14.99 },
   offer: { 0: 4.99, 1: 8.99, 2: 12.99 } };
 app.get('/api/pay/providers', (_, res) => res.json(have));
 
@@ -227,5 +233,75 @@ app.post('/api/pay/ls-webhook', w(async (req, res) => { // Lemon Squeezy
   res.sendStatus(200);
 }));
 
+// ===== لعب جماعي أونلاين (WebSocket بدون مكتبات خارجية) =====
+const http = require('http');
+const server = http.createServer(app);
+const ROOMS = [], PEERS = new Set(), MAXP = 40; let PID = 0;
+const frame = (op, p) => { const n = p.length; let h; if (n < 126) h = Buffer.from([0x80 | op, n]); else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x80 | op; h[1] = 126; h.writeUInt16BE(n, 2); } else { h = Buffer.alloc(10); h[0] = 0x80 | op; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); } return Buffer.concat([h, p]); };
+class Sock {
+  constructor(s) { this.s = s; this.buf = Buffer.alloc(0); this.open = true; this.alive = true; s.on('data', d => this.data(d)); s.on('close', () => this.end()); s.on('error', () => this.end()); }
+  send(o) { if (this.open) try { this.s.write(frame(1, Buffer.from(JSON.stringify(o)))); } catch (e) {} }
+  ping() { if (this.open) try { this.s.write(frame(9, Buffer.alloc(0))); } catch (e) {} }
+  close() { if (this.open) { try { this.s.write(frame(8, Buffer.alloc(0))); this.s.end(); } catch (e) {} this.end(); } }
+  end() { if (this.open) { this.open = false; this.onclose && this.onclose(); } }
+  data(d) {
+    this.alive = true; this.buf = Buffer.concat([this.buf, d]); if (this.buf.length > 262144) return this.close();
+    for (;;) {
+      const b = this.buf; if (b.length < 2) return;
+      const op = b[0] & 15, masked = b[1] & 128; let len = b[1] & 127, off = 2;
+      if (len === 126) { if (b.length < 4) return; len = b.readUInt16BE(2); off = 4; } else if (len === 127) { if (b.length < 10) return; len = Number(b.readBigUInt64BE(2)); off = 10; }
+      if (len > 65536 || !masked) return this.close();
+      if (b.length < off + 4 + len) return;
+      const mask = b.subarray(off, off + 4), p = Buffer.from(b.subarray(off + 4, off + 4 + len)); for (let i = 0; i < len; i++) p[i] ^= mask[i & 3];
+      this.buf = b.subarray(off + 4 + len);
+      if (op === 8) return this.close();
+      if (op === 9) { try { this.s.write(frame(10, p)); } catch (e) {} } else if (op === 1 && this.onmsg) this.onmsg(p.toString());
+    }
+  }
+}
+server.on('upgrade', (req, socket) => {
+  const key = req.headers['sec-websocket-key'];
+  if (req.url.split('?')[0] !== '/ws' || !key) return socket.destroy();
+  const acc = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + acc + '\r\n\r\n');
+  socket.setNoDelay(true); handleSock(new Sock(socket));
+});
+const num = (v, lo, hi) => { v = +v; return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo; };
+const roomFor = () => { let r = ROOMS.find(x => x.peers.size < MAXP); if (!r) { r = { id: ROOMS.length + 1, seed: crypto.randomInt(1, 2147483647), peers: new Map() }; ROOMS.push(r); } return r; };
+const FOODS = ['🍔', '🍉', '🍌', '🍇', '🍎'];
+const infoOf = p => { const st = p.st || {}; return { id: p.id, name: p.name, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: L.lvOf(st.xp), av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
+const bcast = (room, msg, except) => room.peers.forEach(p => { if (p !== except) p.sock.send(msg); });
+function handleSock(sock) {
+  let me = null, cnt = 0, t0 = Date.now();
+  const timer = setTimeout(() => { if (!me) sock.close(); }, 5000);
+  sock.onclose = () => { clearTimeout(timer); if (me) { me.room.peers.delete(me.id); PEERS.delete(me); bcast(me.room, { t: 'leave', id: me.id }); } };
+  sock.onmsg = async raw => {
+    if (Date.now() - t0 > 1000) { t0 = Date.now(); cnt = 0; } if (++cnt > 80) return sock.close();
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    try {
+      if (m.t === 'hello') {
+        if (me) return;
+        const r = await q("select u.id,u.name,u.state from sessions s join users u on u.id=s.user_id where s.token=$1 and s.created > now() - interval '30 days'", [String(m.token || '')]);
+        const u = r.rows[0]; if (!u) return sock.close();
+        for (const p of PEERS) if (p.uid === u.id) p.sock.close(); // اتصال واحد لكل حساب
+        const room = roomFor();
+        me = { id: ++PID, uid: u.id, name: u.name, st: u.state, sock, room, x: 15000, y: 15000, a: 0, g: 0, sc: 0, b: 0, dead: true };
+        room.peers.set(me.id, me); PEERS.add(me);
+        sock.send({ t: 'welcome', id: me.id, seed: room.seed, peers: [...room.peers.values()].filter(p => p !== me).map(infoOf) });
+        bcast(room, { t: 'join', p: infoOf(me) }, me); return;
+      }
+      if (!me) return;
+      if (m.t === 's') { me.x = num(m.x, 0, 30000); me.y = num(m.y, 0, 30000); me.a = num(m.a, -10, 10); me.g = num(m.g, 0, 5000); me.sc = num(m.sc, 0, 1e6); me.b = m.b ? 1 : 0; }
+      else if (m.t === 'eat') { const c = num(m.c, 0, 3599) | 0, k = num(m.k, 0, 15) | 0; bcast(me.room, { t: 'eat', c, k }, me); }
+      else if (m.t === 'drop' && Array.isArray(m.items)) { const items = m.items.slice(0, 200).filter(i => Array.isArray(i) && FOODS.includes(i[2])).map(i => [num(i[0], 0, 30000), num(i[1], 0, 30000), i[2], num(i[3], 0, 10), num(i[4], 0, 10)]); if (items.length) bcast(me.room, { t: 'drop', items }, me); }
+      else if (m.t === 'die') { if (me.dead) return; me.dead = true; bcast(me.room, { t: 'dead', id: me.id }, me); const k = me.room.peers.get(+m.by | 0); if (k && k !== me && !k.dead) k.sock.send({ t: 'kill', x: num(m.x, 0, 30000), y: num(m.y, 0, 30000), name: me.name }); }
+      else if (m.t === 'alive') { if (!me.dead) return; const r = await q('select state from users where id=$1', [me.uid]); if (r.rows[0]) me.st = r.rows[0].state; me.dead = false; me.x = num(m.x, 0, 30000) || me.x; me.y = num(m.y, 0, 30000) || me.y; bcast(me.room, { t: 'join', p: infoOf(me) }, me); }
+    } catch (e) { console.error('ws', e); }
+  };
+}
+setInterval(() => { for (const room of ROOMS) { if (room.peers.size < 2) continue; const arr = [...room.peers.values()].filter(p => !p.dead).map(p => [p.id, Math.round(p.x), Math.round(p.y), +p.a.toFixed(2), Math.floor(p.g), Math.floor(p.sc), p.b]); bcast(room, { t: 'snap', p: arr }); } }, 100).unref();
+setInterval(() => { for (const p of PEERS) { if (!p.sock.alive) p.sock.close(); else { p.sock.alive = false; p.sock.ping(); } } }, 25000).unref();
+app.get('/api/online', (_, res) => res.json({ n: PEERS.size }));
+
 const PORT = process.env.PORT || 3000;
-init().then(() => app.listen(PORT, () => console.log('listening ' + PORT))).catch(e => { console.error('DB init failed', e); process.exit(1); });
+init().then(() => server.listen(PORT, () => console.log('listening ' + PORT))).catch(e => { console.error('DB init failed', e); process.exit(1); });

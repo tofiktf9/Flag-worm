@@ -1,8 +1,8 @@
 // منطق الاقتصاد (دوال نقية بدون قاعدة بيانات) — السيرفر هو المرجع الوحيد لها
 class Bad extends Error {}
 const bad = c => new Bad(c);
-const nd = l => l * l * 120 + 80;
-const lvOf = xp => { let x = xp || 0, l = 1; while (x >= nd(l)) { x -= nd(l); l++; } return l; };
+const nd = l => l * l * 220 + 300; // الخبرة المطلوبة (أصعب)، وأعلى مستوى 999
+const lvOf = xp => { let x = xp || 0, l = 1; while (l < 999 && x >= nd(l)) { x -= nd(l); l++; } return l; };
 const WK = 168 * 36e5, DAY = 864e5;
 const boostOf = (st, now) => (st.bs && now < st.bs.u ? st.bs.m : 0);
 const pay = (st, n) => { if ((st.coins || 0) < n) throw bad('no_coins'); st.coins -= n; };
@@ -27,7 +27,7 @@ function daily(st, now) { if (st.gt && now < st.gt) throw bad('cooldown'); st.co
 function spin(cat, st, now, r) {
   if (st.wt && now < st.wt) throw bad('cooldown');
   let x = r * 100, i = 0; while (i < cat.wp.length - 1 && x >= cat.ww[i]) { x -= cat.ww[i]; i++; }
-  st.coins = (st.coins || 0) + cat.wp[i]; st.wt = now + DAY; return i;
+  st.coins = (st.coins || 0) + cat.wp[i]; st.wt = now + WK; return i; // العجلة كل 168 ساعة
 }
 const MAX_RATE = 30, MAX_RUN_SCORE = 30000, MIN_RUN_SEC = 8, DAY_CAP = 6000, BAG_COINS = 5, BAG_EVERY = 6, FREE_REVIVES = 1, MAX_REVIVES_TOTAL = 3;
 // سقف ما يُكسب من الجولات في 24 ساعة (يمنع مزارع النقاط والأكياس)
