@@ -1,4 +1,5 @@
 // منطق الاقتصاد (دوال نقية بدون قاعدة بيانات) — السيرفر هو المرجع الوحيد لها
+const crypto = require('crypto');
 class Bad extends Error {}
 const bad = c => new Bad(c);
 const nd = l => l * l * 220 + 300; // الخبرة المطلوبة (أصعب)، وأعلى مستوى 999
@@ -29,7 +30,7 @@ function spin(cat, st, now, r) {
   let x = r * 100, i = 0; while (i < cat.wp.length - 1 && x >= cat.ww[i]) { x -= cat.ww[i]; i++; }
   st.coins = (st.coins || 0) + cat.wp[i]; st.wt = now + WK; return i; // العجلة كل 168 ساعة
 }
-const MAX_RATE = 30, MAX_RUN_SCORE = 30000, MIN_RUN_SEC = 8, DAY_CAP = 6000, BAG_COINS = 5, BAG_EVERY = 6, FREE_REVIVES = 1, MAX_REVIVES_TOTAL = 3;
+const MAX_RATE = 30, MAX_RUN_SCORE = 30000, MIN_RUN_SEC = 3, DAY_CAP = 6000, BAG_COINS = 5, BAG_EVERY = 6, FREE_REVIVES = 1, MAX_REVIVES_TOTAL = 3;
 // سقف ما يُكسب من الجولات في 24 ساعة (يمنع مزارع النقاط والأكياس)
 function dayRoom(st, now) { if (now > (st.rcT || 0)) { st.rcT = now + DAY; st.rcDay = 0; } return Math.max(0, DAY_CAP - (st.rcDay || 0)); }
 function runEnd(st, run, score, now, bags) {
@@ -77,4 +78,18 @@ function deliver(cat, st, o) {
     st.coins = (st.coins || 0) + of.c; st.gown = st.gown || ['🪦']; of.g.forEach(e => { if (!st.gown.includes(e)) st.gown.push(e); });
   } else throw bad('bad_item');
 }
-module.exports = { Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+
+// ===== أكواد الهدية: شكلها GIFT-XXXX-XXXXXXX. المولّد (ملف منفصل عندك) يطلع لك الأكواد + ملف بصمات (hash) تحطه في data/batches.
+// السيرفر ما يعرف الأكواد نفسها، بس بصماتها، فما يحتاج أي مفتاح، وما أحد يقدر يصنع كود شغّال بدون ما يضيف بصمته لمستودعك.
+const SALT = 'flag-worm-gift-v1', ITER = 150000;
+const normCode = s => { const t = String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); const m = /^GIFT([A-Z2-9]{4})([A-Z2-9]{7})$/.exec(t); return m ? 'GIFT-' + m[1] + '-' + m[2] : null; };
+const hashCode = code => new Promise((ok, no) => crypto.pbkdf2(code, SALT, ITER, 32, 'sha256', (e, k) => e ? no(e) : ok(k.toString('hex'))));
+function loadBatches(dir) {
+  const fs = require('fs'), path = require('path'), map = new Map();
+  if (!fs.existsSync(dir)) return map;
+  for (const f of fs.readdirSync(dir).filter(x => x.endsWith('.json'))) {
+    try { const j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); for (const c of (j.codes || [])) if (/^[0-9a-f]{64}$/.test(c.h) && Number.isInteger(c.a) && c.a >= 1 && c.a <= 100000) map.set(c.h, c.a); } catch (e) { console.error('bad batch file', f, e.message); }
+  }
+  return map;
+}
+module.exports = { normCode, hashCode, loadBatches, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };

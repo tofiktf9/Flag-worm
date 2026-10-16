@@ -15,7 +15,7 @@ t('معزز 24 ساعة ويتمدد', () => { const st = fresh(); st.coins = 50
 t('الهدية اليومية مرة كل 24 ساعة', () => { const st = fresh(); L.daily(st, NOW); assert.equal(st.coins, 200); thr(() => L.daily(st, NOW + 1000), 'cooldown'); L.daily(st, NOW + L.DAY + 1); assert.equal(st.coins, 300); });
 t('العجلة مرة باليوم والجائزة من القائمة', () => { const st = fresh(), i = L.spin(cat, st, NOW, .5); assert(cat.wp.includes(st.coins - 100)); assert(i >= 0 && i < 6); thr(() => L.spin(cat, st, NOW + 5, .1), 'cooldown'); thr(() => L.spin(cat, st, NOW + 30 * 36e5, .1), 'cooldown'); L.spin(cat, st, NOW + 168 * 36e5 + 1, .1); });
 t('نهاية الجولة: سقف النقاط حسب الوقت (30/ثانية)', () => { const st = fresh(), run = { t0: NOW, paid: 0 }; const r = L.runEnd(st, run, 9999999, NOW + 20000); assert.equal(r.score, 20 * 30 + 50); assert.equal(st.tot, r.score); });
-t('جولة أقصر من 8 ثواني ما تُدفع (يمنع فتح وإغلاق الجولات)', () => { const st = fresh(), run = { t0: NOW, paid: 0 }; const r = L.runEnd(st, run, 500, NOW + 3000, 5); assert.equal(r.score, 0); assert.equal(st.coins, 100); });
+t('جولة أقصر من 3 ثواني ما تُدفع، وبعدها النقاط تتجمّع مع القديمة', () => { const st = fresh(), run = { t0: NOW, paid: 0 }; const r = L.runEnd(st, run, 500, NOW + 2000, 5); assert.equal(r.score, 0); assert.equal(st.coins, 100); const r2 = L.runEnd(st, { t0: NOW, paid: 0 }, 100, NOW + 5000); assert.equal(st.tot, 100); L.runEnd(st, { t0: NOW, paid: 0 }, 60, NOW + 6000); assert.equal(st.tot, 160); });
 t('نفس الجولة لا تُدفع مرتين', () => { const st = fresh(), run = { t0: NOW, paid: 0 }; L.runEnd(st, run, 400, NOW + 60000); const c = st.coins; const r2 = L.runEnd(st, run, 400, NOW + 61000); assert.equal(st.coins, c); assert.equal(r2.coins, 0); });
 t('أكياس الكنز: 5 عملات للكيس وبسقف حسب الوقت', () => { const st = fresh(), run = { t0: NOW, paid: 0 }; const r = L.runEnd(st, run, 0, NOW + 30000, 999); assert.equal(r.bagCo, (Math.floor(30 / 6) + 2) * 5); const r2 = L.runEnd(st, run, 0, NOW + 31000, 999); assert.equal(r2.bagCo, 0); });
 t('سقف الكسب اليومي من الجولات 6000', () => { const st = fresh(); let total = 0; for (let i = 0; i < 40; i++) { const c0 = st.coins; L.runEnd(st, { t0: NOW, paid: 0 }, 99999, NOW + 900000, 0); total += st.coins - c0; } assert(total <= 6000, 'earned ' + total); st.rcT = 0; const c1 = st.coins; L.runEnd(st, { t0: NOW, paid: 0 }, 99999, NOW + 900000 + 2e9, 0); assert(st.coins > c1); });
@@ -25,4 +25,12 @@ t('المستوى يصعب وترقية تعطي 50 عملة', () => { assert.eq
 t('العرض: يسلّم السكنات والعملات والقبور حسب الكتالوج', () => { const st = fresh(); L.deliver(cat, st, { kind: 'offer', item: 1 }); assert(cat.offers[1].sk.every(i => st.own.includes(i))); assert.equal(st.coins, 100 + cat.offers[1].c); assert.deepEqual(st.ob, [1]); });
 t('عرض مدفوع مرتين لا يعطي عملات مرتين', () => { const st = fresh(); L.deliver(cat, st, { kind: 'offer', item: 0 }); const c = st.coins; L.deliver(cat, st, { kind: 'offer', item: 0 }); assert.equal(st.coins, c); });
 t('الإعدادات: لا يمكن لبس شي غير مملوك أو تغيير العملات', () => { const st = fresh(); L.prefs(cat, st, { skin: 40, coins: 99999, fsk: 'DZ', gsel: '⚱️', ef: 3, flag: 'FR', av: '😎' }); assert.equal(st.coins, 100); assert.notEqual(st.skin, 40); assert(!st.fsk); assert.notEqual(st.gsel, '⚱️'); assert.notEqual(st.ef, 3); assert.equal(st.flag, 'FR'); });
-console.log(n + ' tests passed');
+(async () => {
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const code = 'GIFT-ABCD-EFGH234', h = await L.hashCode(code);
+  assert.equal(L.normCode(' gift-abcd-efgh234 '), code); assert.equal(L.normCode('giftabcdefgh234'), code); assert.equal(L.normCode('GIFT-ABCD-EFGH23'), null); assert.equal(h, await L.hashCode(L.normCode('gift abcd efgh234'))); assert.notEqual(h, await L.hashCode('GIFT-ABCD-EFGH235'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b-')); fs.writeFileSync(path.join(dir, 'codes-1.json'), JSON.stringify({ v: 1, codes: [{ h, a: 5000 }, { h: 'zz', a: 5 }, { h: h.replace(/./, 'f'), a: 999999 }] })); fs.writeFileSync(path.join(dir, 'bad.json'), '{oops');
+  const m = L.loadBatches(dir); assert.equal(m.size, 1); assert.equal(m.get(h), 5000); assert.equal(L.loadBatches('/nonexistent').size, 0);
+  n++; console.log('ok - أكواد الهدية: تنسيق، بصمة ثابتة، تحميل الدفعات وتجاهل الملفات التالفة');
+  console.log(n + ' tests passed');
+})();

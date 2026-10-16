@@ -18,6 +18,7 @@ async function init0() {
   create table if not exists sessions(token text primary key, user_id int references users(id) on delete cascade, created timestamptz default now());
   create table if not exists orders(id serial primary key, user_id int references users(id), kind text not null, item int not null, amount int not null, status text not null default 'pending', checkout_id text unique, created timestamptz default now(), paid_at timestamptz);
   alter table orders add column if not exists provider text; alter table orders add column if not exists usd_cents int;
+  create table if not exists used_codes(hash text primary key, user_id int, coins int not null, used_at timestamptz default now());
   create table if not exists codes(code text primary key, coins int not null, used_by int, used_at timestamptz, created_by int, created timestamptz default now());`);
 }
 async function init() { // لو السيرفر ما يدعم SSL (اتصال داخلي) نعيد المحاولة بدونه
@@ -43,8 +44,8 @@ const authm = w(async (req, res, next) => {
   req.u = r.rows[0]; next();
 });
 const newSession = async uid => { const t = crypto.randomBytes(32).toString('hex'); await q('insert into sessions(token,user_id) values($1,$2)', [t, uid]); return t; };
-const OWNER = (process.env.OWNER_USER || '').trim().toLowerCase(); // اسم حساب المالك (يظهر له تبويب الأكواد)
-const isOwner = u => !!OWNER && u.name_lower === OWNER;
+const GIFT = L.loadBatches(path.join(__dirname, 'data', 'batches')); // بصمات أكواد الهدية (من الملفات اللي تحطها في data/batches)
+console.log('gift codes loaded:', GIFT.size);
 const DEF = () => ({ flag: 'DZ', skin: 0, own: [0], coins: 100, xp: 0, best: 0, tot: 0 });
 
 // تحديث حالة اللاعب داخل معاملة مقفولة (يمنع السباق بين الطلبات)
@@ -89,10 +90,14 @@ app.post('/api/login', guard(10), w(async (req, res) => {
   if (!u || !sameSig(hh, u.hash)) { f.push(Date.now()); fails.set(k, f); if (fails.size > 20000) fails.clear(); return res.status(401).json({ error: 'bad_login' }); }
   fails.delete(k);
   await q("delete from sessions where created < now() - interval '30 days'");
-  res.json({ token: await newSession(u.id), name: u.name, state: u.state, owner: isOwner(u) });
+  res.json({ token: await newSession(u.id), name: u.name, state: u.state });
 }));
 app.post('/api/logout', authm, w(async (req, res) => { await q('delete from sessions where token=$1', [(req.headers.authorization || '').slice(7)]); res.json({ ok: 1 }); }));
-app.get('/api/me', authm, (req, res) => res.json({ name: req.u.name, state: req.u.state, now: Date.now(), owner: isOwner(req.u) }));
+app.get('/api/me', authm, w(async (req, res) => {
+  const st = req.u.state || {}, ks = Object.keys(st.codes || {});
+  if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ name: req.u.name, state: s2, now: Date.now() }); } }
+  res.json({ name: req.u.name, state: st, now: Date.now() });
+}));
 
 // ===== الاقتصاد: كله هنا في السيرفر (العميل ما يقدر يعدّل العملات أو المشتريات) =====
 app.put('/api/prefs', ...act(30, (st, req) => { L.prefs(CAT, st, req.body || {}); }));
@@ -109,7 +114,7 @@ app.post('/api/run/start', ...act(30, (st, req) => {
   RUNS.set(id, { uid: req.u.id, t0: Date.now(), paid: 0, revives: 0, lastCo: 0, bonusUsed: true });
   return { run: id };
 }));
-app.post('/api/run/end', ...act(60, (st, req) => ({ reward: L.runEnd(st, runOf(req), (req.body || {}).score, Date.now(), (req.body || {}).bags) })));
+app.post('/api/run/end', ...act(60, (st, req) => { LBC.t = 0; return { reward: L.runEnd(st, runOf(req), (req.body || {}).score, Date.now(), (req.body || {}).bags) }; })); // يحدّث المتصدرين فوراً
 app.post('/api/run/revive', ...act(30, (st, req) => { L.runRevive(st, runOf(req), !!(req.body || {}).free); }));
 app.post('/api/run/bonus', ...act(30, (st, req) => { L.runBonus(st, runOf(req), Date.now()); }));
 
@@ -132,39 +137,21 @@ app.post('/api/code/create', authm, guard(10), w(async (req, res) => {
   res.json({ code });
 }));
 app.post('/api/redeem', ...act(10, async (st, req) => {
-  const code = String((req.body || {}).code || '').trim().toUpperCase();
-  const r = await q('update codes set used_by=$1, used_at=now() where code=$2 and used_by is null returning coins', [req.u.id, code]);
-  if (!r.rows[0]) { const ex = await q('select 1 from codes where code=$1', [code]); throw new L.Bad(ex.rows[0] ? 'used' : 'invalid'); }
+  const raw = String((req.body || {}).code || '').trim().toUpperCase();
+  const c = L.normCode(raw);
+  if (c) {
+    const h = await L.hashCode(c), amt = GIFT.get(h);
+    if (amt) {
+      const r = await q('insert into used_codes(hash,user_id,coins) values($1,$2,$3) on conflict do nothing returning coins', [h, req.u.id, amt]);
+      if (!r.rows[0]) throw new L.Bad('used');
+      st.coins = (st.coins || 0) + amt; return { coins: amt };
+    }
+  }
+  const key = c || raw;
+  const r = await q('update codes set used_by=$1, used_at=now() where code=$2 and used_by is null returning coins', [req.u.id, key]);
+  if (!r.rows[0]) { const ex = await q('select 1 from codes where code=$1', [key]); throw new L.Bad(ex.rows[0] ? 'used' : 'invalid'); }
+  if (st.codes) delete st.codes[key];
   st.coins = (st.coins || 0) + r.rows[0].coins; return { coins: r.rows[0].coins };
-}));
-app.post('/api/admin/code', guard(10), w(async (req, res) => {
-  if (!process.env.ADMIN_KEY || !sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) return res.sendStatus(403);
-  const coins = Math.floor(+(req.body || {}).coins), n = Math.min(Math.max(Math.floor(+(req.body || {}).count) || 1, 1), 100);
-  if (!(coins > 0 && coins <= 100000)) return res.status(400).json({ error: 'bad_amount' });
-  const codes = [];
-  for (let i = 0; i < n; i++) { const c = 'FREE-' + crypto.randomBytes(5).toString('hex').toUpperCase(); await q('insert into codes(code,coins) values($1,$2)', [c, coins]); codes.push(c); }
-  res.json({ codes });
-}));
-
-// ===== لوحة المالك: حساب المالك (OWNER_USER) + مفتاح الأدمن (ADMIN_KEY) معاً =====
-const ownerOnly = (req, res, next) => (isOwner(req.u) && process.env.ADMIN_KEY && sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) ? next() : res.status(403).json({ error: 'forbidden' });
-const AMOUNTS = [50, 100, 200, 500, 1000, 2000, 5000];
-app.post('/api/owner/code', authm, ownerOnly, guard(30), w(async (req, res) => {
-  const coins = +(req.body || {}).coins, n = Math.min(Math.max(+(req.body || {}).count || 1, 1), 50);
-  if (!AMOUNTS.includes(coins)) return res.status(400).json({ error: 'bad_amount' });
-  const codes = [];
-  for (let i = 0; i < n; i++) { const c = 'GIFT-' + crypto.randomBytes(5).toString('hex').toUpperCase(); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [c, coins, req.u.id]); codes.push(c); }
-  res.json({ codes });
-}));
-app.get('/api/owner/codes', authm, ownerOnly, guard(60), w(async (req, res) => {
-  const r = await q('select c.code, c.coins, c.created, u.name as used_name from codes c left join users u on u.id=c.used_by order by c.created desc limit 200');
-  res.json({ codes: r.rows });
-}));
-
-app.get('/api/admin/codes', guard(30), w(async (req, res) => {
-  if (!process.env.ADMIN_KEY || !sameSig(req.get('x-admin-key'), process.env.ADMIN_KEY)) return res.sendStatus(403);
-  const r = await q('select c.code, c.coins, c.created, u.name as used_name from codes c left join users u on u.id=c.used_by order by c.created desc limit 500');
-  res.json({ codes: r.rows });
 }));
 
 // ===== الدفع: Chargily (بطاقات جزائرية) + Lemon Squeezy (بطاقات دولية / PayPal) =====
@@ -175,6 +162,7 @@ const RATE = +process.env.DZD_PER_USD || 135, BASE = (process.env.PUBLIC_URL || 
 const have = { cg: !!(CK && BASE), ls: !!(LK && LS_STORE && LS_VARIANT && LS_SECRET && BASE) };
 const PRICE = { // الأسعار بالدولار (مصدر الحقيقة هنا في السيرفر)
   coins: { 1500: .99, 3500: 2.49, 6500: 4.99, 9500: 7.99, 15000: 14.99 },
+  gift: { 500: .59, 1500: 1.49, 5000: 4.99, 10000: 9.99, 25000: 24.99 }, // بطاقات الهدية (رمز تعطيه لأي أحد)
   offer: { 0: 4.99, 1: 8.99, 2: 12.99 } };
 app.get('/api/pay/providers', (_, res) => res.json(have));
 
@@ -208,7 +196,14 @@ app.post('/api/pay/checkout', authm, guard(10), w(async (req, res) => {
   res.json({ url });
 }));
 
-async function deliverOrder(o) { await tx(o.user_id, st => L.deliver(CAT, st, o)); } // يُستدعى مرة وحدة لكل طلب مدفوع
+const GA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', newGift = () => { const r = Array.from(crypto.randomBytes(11), x => GA[x & 31]).join(''); return 'GIFT-' + r.slice(0, 4) + '-' + r.slice(4); };
+async function deliverOrder(o) {
+  if (o.kind === 'gift') { // بطاقة هدية: نصنع كود ونحطه في جدول أكواد اللاعب
+    const code = newGift(); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [code, o.item, o.user_id]);
+    await tx(o.user_id, st => { (st.codes = st.codes || {})[code] = o.item; }); return;
+  }
+  await tx(o.user_id, st => L.deliver(CAT, st, o));
+} // يُستدعى مرة وحدة لكل طلب مدفوع
 
 app.post('/api/pay/webhook', w(async (req, res) => { // Chargily
   const sig = req.get('signature');

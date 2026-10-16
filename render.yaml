@@ -29,10 +29,6 @@ services:
         sync: false
       - key: LEMONSQUEEZY_TEST_MODE
         value: "1"
-      - key: ADMIN_KEY
-        sync: false
-      - key: OWNER_USER
-        sync: false
       - key: DZD_PER_USD
         value: "135"
 # تنبيه مهم: قاعدة Render المجانية تنتهي بعد 30 يوم (ثم 14 يوم مهلة) وبعدها تُحذف مع كل الحسابات، وما فيها نسخ احتياطي.
