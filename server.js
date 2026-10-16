@@ -17,7 +17,7 @@ async function init0() {
     salt text not null, hash text not null, state jsonb not null default '{}', upd bigint not null default 0, created timestamptz default now());
   create table if not exists sessions(token text primary key, user_id int references users(id) on delete cascade, created timestamptz default now());
   create table if not exists orders(id serial primary key, user_id int references users(id), kind text not null, item int not null, amount int not null, status text not null default 'pending', checkout_id text unique, created timestamptz default now(), paid_at timestamptz);
-  alter table orders add column if not exists provider text; alter table orders add column if not exists usd_cents int;
+  alter table orders add column if not exists picks text; alter table orders add column if not exists provider text; alter table orders add column if not exists usd_cents int;
   create table if not exists used_codes(hash text primary key, user_id int, coins int not null, used_at timestamptz default now());
   create table if not exists codes(code text primary key, coins int not null, used_by int, used_at timestamptz, created_by int, created timestamptz default now());`);
 }
@@ -44,8 +44,11 @@ const authm = w(async (req, res, next) => {
   req.u = r.rows[0]; next();
 });
 const newSession = async uid => { const t = crypto.randomBytes(32).toString('hex'); await q('insert into sessions(token,user_id) values($1,$2)', [t, uid]); return t; };
-const GIFT = L.loadBatches(path.join(__dirname, 'data', 'batches')); // بصمات أكواد الهدية (من الملفات اللي تحطها في data/batches)
+const GIFT = L.loadHashes(['/etc/secrets', path.join(__dirname, 'data', 'secret')]); // بصمات أكواد الهدية الجاهزة (Render Secret Files)
 console.log('gift codes loaded:', GIFT.size);
+const OWNER = (process.env.OWNER_USER || '').trim().toLowerCase(); // اسم حسابك: يطلع لك لفل 999 (لك أنت بس)
+const isOwner = u => !!OWNER && u.name_lower === OWNER;
+const withOw = (st, u, now) => { const s = { ...st, ow: isOwner(u) ? 1 : 0 }; L.fixVip(CAT, s, now || Date.now()); return s; };
 const DEF = () => ({ flag: 'DZ', skin: 0, own: [0], coins: 100, xp: 0, best: 0, tot: 0 });
 
 // تحديث حالة اللاعب داخل معاملة مقفولة (يمنع السباق بين الطلبات)
@@ -74,7 +77,7 @@ app.post('/api/register', guard(10), w(async (req, res) => {
   const salt = crypto.randomBytes(16).toString('hex');
   try {
     const r = await q('insert into users(name,name_lower,email,salt,hash,state) values($1,$2,$3,$4,$5,$6) returning id', [n, n.toLowerCase(), e || null, salt, await hash(password, salt), DEF()]);
-    res.json({ token: await newSession(r.rows[0].id), name: n, state: DEF() });
+    res.json({ token: await newSession(r.rows[0].id), name: n, state: withOw(DEF(), { name_lower: n.toLowerCase() }) });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: /email/.test(err.detail || '') ? 'email_taken' : 'name_taken' });
     throw err;
@@ -90,13 +93,13 @@ app.post('/api/login', guard(10), w(async (req, res) => {
   if (!u || !sameSig(hh, u.hash)) { f.push(Date.now()); fails.set(k, f); if (fails.size > 20000) fails.clear(); return res.status(401).json({ error: 'bad_login' }); }
   fails.delete(k);
   await q("delete from sessions where created < now() - interval '30 days'");
-  res.json({ token: await newSession(u.id), name: u.name, state: u.state });
+  res.json({ token: await newSession(u.id), name: u.name, state: withOw(u.state, u) });
 }));
 app.post('/api/logout', authm, w(async (req, res) => { await q('delete from sessions where token=$1', [(req.headers.authorization || '').slice(7)]); res.json({ ok: 1 }); }));
 app.get('/api/me', authm, w(async (req, res) => {
   const st = req.u.state || {}, ks = Object.keys(st.codes || {});
-  if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ name: req.u.name, state: s2, now: Date.now() }); } }
-  res.json({ name: req.u.name, state: st, now: Date.now() });
+  if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ name: req.u.name, state: withOw(s2, req.u), now: Date.now() }); } }
+  res.json({ name: req.u.name, state: withOw(st, req.u), now: Date.now() });
 }));
 
 // ===== الاقتصاد: كله هنا في السيرفر (العميل ما يقدر يعدّل العملات أو المشتريات) =====
@@ -136,22 +139,27 @@ app.post('/api/code/create', authm, guard(10), w(async (req, res) => {
   await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [code, coins, req.u.id]);
   res.json({ code });
 }));
+const bad = new Map(); // محاولات الكود الخاطئة (يمنع تخمين الأكواد)
+const badN = (k, ms) => { const n = Date.now(), a = (bad.get(k) || []).filter(t => n - t < ms); bad.set(k, a); if (bad.size > 50000) bad.clear(); return a.length; };
+const badAdd = (...ks) => ks.forEach(k => { const a = bad.get(k) || []; a.push(Date.now()); bad.set(k, a); });
 app.post('/api/redeem', ...act(10, async (st, req) => {
-  const raw = String((req.body || {}).code || '').trim().toUpperCase();
-  const c = L.normCode(raw);
+  const raw = String((req.body || {}).code || '').trim().toUpperCase(), c = L.normCode(raw), key = c || raw, ku = 'u' + req.u.id, ki = 'i' + req.ip;
+  if (badN(ku, 600000) >= 10 || badN(ki, 3600000) >= 30) throw new L.Bad('rate'); // 10 محاولات خاطئة بـ10 دقايق، أو 30 من نفس الشبكة بالساعة
+  // 1) أكواد بطاقات الهدية المشتراة (محفوظة في القاعدة)
+  const r = await q('update codes set used_by=$1, used_at=now() where code=$2 and used_by is null returning coins', [req.u.id, key]);
+  if (r.rows[0]) { if (st.codes) delete st.codes[key]; st.coins = (st.coins || 0) + r.rows[0].coins; return { coins: r.rows[0].coins }; }
+  const ex = await q('select 1 from codes where code=$1', [key]);
+  if (ex.rows[0]) throw new L.Bad('used');
+  // 2) الأكواد الجاهزة (ملفات txt اللي عندك): نقارن بصمتها بالقائمة السرّية
   if (c) {
     const h = await L.hashCode(c), amt = GIFT.get(h);
     if (amt) {
-      const r = await q('insert into used_codes(hash,user_id,coins) values($1,$2,$3) on conflict do nothing returning coins', [h, req.u.id, amt]);
-      if (!r.rows[0]) throw new L.Bad('used');
+      const u = await q('insert into used_codes(hash,user_id,coins) values($1,$2,$3) on conflict do nothing returning coins', [h, req.u.id, amt]);
+      if (!u.rows[0]) throw new L.Bad('used');
       st.coins = (st.coins || 0) + amt; return { coins: amt };
     }
   }
-  const key = c || raw;
-  const r = await q('update codes set used_by=$1, used_at=now() where code=$2 and used_by is null returning coins', [req.u.id, key]);
-  if (!r.rows[0]) { const ex = await q('select 1 from codes where code=$1', [key]); throw new L.Bad(ex.rows[0] ? 'used' : 'invalid'); }
-  if (st.codes) delete st.codes[key];
-  st.coins = (st.coins || 0) + r.rows[0].coins; return { coins: r.rows[0].coins };
+  badAdd(ku, ki); throw new L.Bad('invalid');
 }));
 
 // ===== الدفع: Chargily (بطاقات جزائرية) + Lemon Squeezy (بطاقات دولية / PayPal) =====
@@ -162,7 +170,8 @@ const RATE = +process.env.DZD_PER_USD || 135, BASE = (process.env.PUBLIC_URL || 
 const have = { cg: !!(CK && BASE), ls: !!(LK && LS_STORE && LS_VARIANT && LS_SECRET && BASE) };
 const PRICE = { // الأسعار بالدولار (مصدر الحقيقة هنا في السيرفر)
   coins: { 1500: .99, 3500: 2.49, 6500: 4.99, 9500: 7.99, 15000: 14.99 },
-  gift: { 500: .59, 1500: 1.49, 5000: 4.99, 10000: 9.99, 25000: 24.99 }, // بطاقات الهدية (رمز تعطيه لأي أحد)
+  gift: { 500: .59, 1500: 1.49, 5000: 4.99, 10000: 9.99, 25000: 15.99 }, // بطاقات الهدية (رمز تعطيه لأي أحد)
+  vip: { 1: .99, 7: 3.99, 30: 9.99, 90: 24.99 }, // اشتراك الحساب المميز (أيام)
   offer: { 0: 4.99, 1: 8.99, 2: 12.99 } };
 app.get('/api/pay/providers', (_, res) => res.json(have));
 
@@ -173,8 +182,9 @@ app.post('/api/pay/checkout', authm, guard(10), w(async (req, res) => {
   if (!have[p]) p = have.cg ? 'cg' : have.ls ? 'ls' : null;
   if (!p) return res.status(503).json({ error: 'payments_disabled' });
   if (kind === 'offer') { const ob = (req.u.state || {}).ob || []; if (ob.includes(+item) || (+item > 0 && !ob.includes(+item - 1))) return res.status(400).json({ error: 'offer_locked' }); }
+  const picks = kind === 'offer' ? L.cleanPicks(CAT, req.u.state || {}, +item, (req.body || {}).picks) : null; // لازم تختار العدد المطلوب من السكنات
   const dzd = Math.max(1, Math.round(usd * RATE)), cents = Math.round(usd * 100);
-  const o = await q('insert into orders(user_id,kind,item,amount,provider,usd_cents) values($1,$2,$3,$4,$5,$6) returning id', [req.u.id, kind, +item, dzd, p, cents]);
+  const o = await q('insert into orders(user_id,kind,item,amount,provider,usd_cents,picks) values($1,$2,$3,$4,$5,$6,$7) returning id', [req.u.id, kind, +item, dzd, p, cents, picks ? JSON.stringify(picks) : null]);
   const oid = o.rows[0].id;
   if (p === 'cg') {
     const r = await fetch(`https://pay.chargily.net${CG_TEST ? '/test' : ''}/api/v2/checkouts`, { method: 'POST',
@@ -196,13 +206,13 @@ app.post('/api/pay/checkout', authm, guard(10), w(async (req, res) => {
   res.json({ url });
 }));
 
-const GA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', newGift = () => { const r = Array.from(crypto.randomBytes(11), x => GA[x & 31]).join(''); return 'GIFT-' + r.slice(0, 4) + '-' + r.slice(4); };
+const GA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', newGift = () => { return 'GIFT-' + Array.from(crypto.randomBytes(6), x => GA[x & 31]).join(''); };
 async function deliverOrder(o) {
   if (o.kind === 'gift') { // بطاقة هدية: نصنع كود ونحطه في جدول أكواد اللاعب
     const code = newGift(); await q('insert into codes(code,coins,created_by) values($1,$2,$3)', [code, o.item, o.user_id]);
     await tx(o.user_id, st => { (st.codes = st.codes || {})[code] = o.item; }); return;
   }
-  await tx(o.user_id, st => L.deliver(CAT, st, o));
+  await tx(o.user_id, st => L.deliver(CAT, st, { ...o, picks: o.picks ? JSON.parse(o.picks) : [] }));
 } // يُستدعى مرة وحدة لكل طلب مدفوع
 
 app.post('/api/pay/webhook', w(async (req, res) => { // Chargily
@@ -264,7 +274,7 @@ server.on('upgrade', (req, socket) => {
 const num = (v, lo, hi) => { v = +v; return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo; };
 const roomFor = () => { let r = ROOMS.find(x => x.peers.size < MAXP); if (!r) { r = { id: ROOMS.length + 1, seed: crypto.randomInt(1, 2147483647), peers: new Map() }; ROOMS.push(r); } return r; };
 const FOODS = ['🍔', '🍉', '🍌', '🍇', '🍎'];
-const infoOf = p => { const st = p.st || {}; return { id: p.id, name: p.name, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: L.lvOf(st.xp), av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
+const infoOf = p => { const st0 = p.st || {}, now = Date.now(), st = { ...st0 }; L.fixVip(CAT, st, now); return { id: p.id, name: p.name, vip: L.vipActive(st, now) ? 1 : 0, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: p.owner ? 999 : L.lvOf(st.xp), av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
 const bcast = (room, msg, except) => room.peers.forEach(p => { if (p !== except) p.sock.send(msg); });
 function handleSock(sock) {
   let me = null, cnt = 0, t0 = Date.now();
@@ -276,11 +286,11 @@ function handleSock(sock) {
     try {
       if (m.t === 'hello') {
         if (me) return;
-        const r = await q("select u.id,u.name,u.state from sessions s join users u on u.id=s.user_id where s.token=$1 and s.created > now() - interval '30 days'", [String(m.token || '')]);
+        const r = await q("select u.id,u.name,u.name_lower,u.state from sessions s join users u on u.id=s.user_id where s.token=$1 and s.created > now() - interval '30 days'", [String(m.token || '')]);
         const u = r.rows[0]; if (!u) return sock.close();
         for (const p of PEERS) if (p.uid === u.id) p.sock.close(); // اتصال واحد لكل حساب
         const room = roomFor();
-        me = { id: ++PID, uid: u.id, name: u.name, st: u.state, sock, room, x: 15000, y: 15000, a: 0, g: 0, sc: 0, b: 0, dead: true };
+        me = { id: ++PID, uid: u.id, name: u.name, owner: isOwner(u), st: u.state, sock, room, x: 15000, y: 15000, a: 0, g: 0, sc: 0, b: 0, dead: true };
         room.peers.set(me.id, me); PEERS.add(me);
         sock.send({ t: 'welcome', id: me.id, seed: room.seed, peers: [...room.peers.values()].filter(p => p !== me).map(infoOf) });
         bcast(room, { t: 'join', p: infoOf(me) }, me); return;
@@ -294,7 +304,7 @@ function handleSock(sock) {
     } catch (e) { console.error('ws', e); }
   };
 }
-setInterval(() => { for (const room of ROOMS) { if (room.peers.size < 2) continue; const arr = [...room.peers.values()].filter(p => !p.dead).map(p => [p.id, Math.round(p.x), Math.round(p.y), +p.a.toFixed(2), Math.floor(p.g), Math.floor(p.sc), p.b]); bcast(room, { t: 'snap', p: arr }); } }, 100).unref();
+setInterval(() => { for (const room of ROOMS) { if (room.peers.size < 2) continue; const arr = [...room.peers.values()].filter(p => !p.dead).map(p => [p.id, Math.round(p.x), Math.round(p.y), +p.a.toFixed(2), Math.floor(p.g), Math.floor(p.sc), p.b]); bcast(room, { t: 'snap', p: arr }); } }, 50).unref(); // 20 تحديث بالثانية
 setInterval(() => { for (const p of PEERS) { if (!p.sock.alive) p.sock.close(); else { p.sock.alive = false; p.sock.ping(); } } }, 25000).unref();
 app.get('/api/online', (_, res) => res.json({ n: PEERS.size }));
 

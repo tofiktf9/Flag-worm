@@ -3,7 +3,7 @@ const crypto = require('crypto');
 class Bad extends Error {}
 const bad = c => new Bad(c);
 const nd = l => l * l * 220 + 300; // الخبرة المطلوبة (أصعب)، وأعلى مستوى 999
-const lvOf = xp => { let x = xp || 0, l = 1; while (l < 999 && x >= nd(l)) { x -= nd(l); l++; } return l; };
+const lvOf = xp => { let x = xp || 0, l = 1; while (l < 998 && x >= nd(l)) { x -= nd(l); l++; } return l; };
 const WK = 168 * 36e5, DAY = 864e5;
 const boostOf = (st, now) => (st.bs && now < st.bs.u ? st.bs.m : 0);
 const pay = (st, n) => { if ((st.coins || 0) < n) throw bad('no_coins'); st.coins -= n; };
@@ -60,36 +60,51 @@ function runRevive(st, run, free) {
   else pay(st, 100);
   run.revives = (run.revives || 0) + 1;
 }
+const vipActive = (st, now) => !!st.vip && st.vip > (now || Date.now());
+function fixVip(cat, st, now) { const k = cat.skins[st.skin | 0]; if (k && k.vip && !vipActive(st, now)) st.skin = 0; }
+function cleanPicks(cat, st, idx, picks) { // اختيار سكنات العرض: العدد المطلوب بالضبط، من قائمة العرض، وما تملكها
+  const of = cat.offers[idx]; if (!of) throw bad('bad_item');
+  const own = st.own || [0], avail = of.pool.filter(k => !own.includes(k)), need = Math.min(of.pick, avail.length);
+  const p = [...new Set((Array.isArray(picks) ? picks : []).map(Number))];
+  if (p.length !== need || !p.every(k => avail.includes(k))) throw bad('bad_picks');
+  return p;
+}
 function prefs(cat, st, b) {
   if (typeof b.flag === 'string' && cat.flags.includes(b.flag)) st.flag = b.flag;
   if (typeof b.av === 'string') st.av = b.av.slice(0, 4);
   if (!b.pic) delete st.pic; else if (typeof b.pic === 'string' && b.pic.length < 60000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(b.pic)) st.pic = b.pic;
-  if (Number.isInteger(b.skin) && (st.own || [0]).includes(b.skin)) st.skin = b.skin;
+  if (Number.isInteger(b.skin) && ((st.own || [0]).includes(b.skin) || (cat.skins[b.skin] && cat.skins[b.skin].vip && vipActive(st)))) st.skin = b.skin;
   if (!b.fsk) st.fsk = ''; else if ((st.fown || []).includes(b.fsk)) st.fsk = b.fsk;
   if (typeof b.gsel === 'string' && (b.gsel === '🪦' || (st.gown || []).includes(b.gsel))) st.gsel = b.gsel;
   if (Number.isInteger(b.ef) && (b.ef === 0 || (st.eo || []).includes(b.ef))) st.ef = b.ef;
 }
 function deliver(cat, st, o) {
   if (o.kind === 'coins') st.coins = (st.coins || 0) + o.item;
+  else if (o.kind === 'vip') { const d = +o.item; if (![1, 7, 30, 90].includes(d)) throw bad('bad_item'); st.vip = Math.max(Date.now(), st.vip || 0) + d * DAY; }
   else if (o.kind === 'offer') {
     const of = cat.offers[o.item]; if (!of) throw bad('bad_item');
     st.ob = st.ob || []; if (st.ob.includes(o.item)) return false; st.ob.push(o.item);
-    st.own = st.own || [0]; of.sk.forEach(i => { if (i >= 0 && !st.own.includes(i)) st.own.push(i); });
+    st.own = st.own || [0];
+    const picks = [...new Set((o.picks || []).map(Number))].filter(i => of.pool.includes(i) && !st.own.includes(i)).slice(0, of.pick);
+    picks.forEach(i => st.own.push(i));
     st.coins = (st.coins || 0) + of.c; st.gown = st.gown || ['🪦']; of.g.forEach(e => { if (!st.gown.includes(e)) st.gown.push(e); });
   } else throw bad('bad_item');
 }
 
-// ===== أكواد الهدية: شكلها GIFT-XXXX-XXXXXXX. المولّد (ملف منفصل عندك) يطلع لك الأكواد + ملف بصمات (hash) تحطه في data/batches.
-// السيرفر ما يعرف الأكواد نفسها، بس بصماتها، فما يحتاج أي مفتاح، وما أحد يقدر يصنع كود شغّال بدون ما يضيف بصمته لمستودعك.
+// ===== أكواد الهدية: GIFT-XXXXXX. السيرفر يحفظ بصمات الأكواد الجاهزة فقط (ملفات hashes-<الكمية>.txt)، مو الأكواد نفسها.
 const SALT = 'flag-worm-gift-v1', ITER = 150000;
-const normCode = s => { const t = String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); const m = /^GIFT([A-Z2-9]{4})([A-Z2-9]{7})$/.exec(t); return m ? 'GIFT-' + m[1] + '-' + m[2] : null; };
-const hashCode = code => new Promise((ok, no) => crypto.pbkdf2(code, SALT, ITER, 32, 'sha256', (e, k) => e ? no(e) : ok(k.toString('hex'))));
-function loadBatches(dir) {
+const normCode = s => { const m = /^GIFT([A-Z0-9]{6})$/.exec(String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')); return m ? 'GIFT-' + m[1] : null; };
+const hashCode = code => new Promise((ok, no) => crypto.pbkdf2(code, SALT, ITER, 32, 'sha256', (e, k) => e ? no(e) : ok(k.toString('hex').slice(0, 16))));
+function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمية من اسم الملف) من أماكن سرّية مثل /etc/secrets على Render
   const fs = require('fs'), path = require('path'), map = new Map();
-  if (!fs.existsSync(dir)) return map;
-  for (const f of fs.readdirSync(dir).filter(x => x.endsWith('.json'))) {
-    try { const j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); for (const c of (j.codes || [])) if (/^[0-9a-f]{64}$/.test(c.h) && Number.isInteger(c.a) && c.a >= 1 && c.a <= 100000) map.set(c.h, c.a); } catch (e) { console.error('bad batch file', f, e.message); }
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      const m = /^hashes-(\d+)\.txt$/.exec(f); if (!m) continue;
+      const amt = +m[1]; if (!(amt >= 1 && amt <= 100000)) continue;
+      for (const line of fs.readFileSync(path.join(dir, f), 'utf8').split(/\s+/)) if (/^[0-9a-f]{16}$/.test(line)) map.set(line, amt);
+    }
   }
   return map;
 }
-module.exports = { normCode, hashCode, loadBatches, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+module.exports = { vipActive, fixVip, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };

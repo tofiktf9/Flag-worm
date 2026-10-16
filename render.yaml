@@ -19,6 +19,8 @@ services:
         value: test
       - key: PUBLIC_URL
         sync: false
+      - key: OWNER_USER
+        sync: false
       - key: LEMONSQUEEZY_API_KEY
         sync: false
       - key: LEMONSQUEEZY_STORE_ID
