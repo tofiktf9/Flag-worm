@@ -1,1 +1,2 @@
-مكان ملفات البصمات (hashes-500.txt وغيرها) للتشغيل المحلي فقط. على Render ارفعها كـ Secret Files. لا ترفع ملفات hashes إلى GitHub.
+بصمات أكواد الهدية (hashes-500.txt و hashes-1500.txt و hashes-5000.txt). السيرفر يقرأها من هنا تلقائياً، فالأكواد تشتغل بدون أي إعداد.
+للحماية الأقوى: اجعل المستودع Private، أو انقلها إلى Render ← Secret Files (شوف README.md).

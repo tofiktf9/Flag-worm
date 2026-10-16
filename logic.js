@@ -20,7 +20,7 @@ function buy(cat, st, { kind, id }, now) {
   if (kind === 'skin') { const i = +id, p = skinPrice(cat, i, now); if (p == null) throw bad('bad_item'); if (st.own.includes(i)) throw bad('owned'); pay(st, p); st.own.push(i); }
   else if (kind === 'flag') { if (!cat.flags.includes(id)) throw bad('bad_item'); st.fown = st.fown || []; if (st.fown.includes(id)) throw bad('owned'); pay(st, 50); st.fown.push(id); }
   else if (kind === 'grave') { const v = cat.graves.find(g => g.e === id); if (!v || v.x || !(v.p > 0)) throw bad('bad_item'); st.gown = st.gown || ['🪦']; if (st.gown.includes(id)) throw bad('owned'); pay(st, v.p); st.gown.push(id); }
-  else if (kind === 'effect') { const i = +id; if (!(i >= 1 && i < cat.ep.length)) throw bad('bad_item'); st.eo = st.eo || []; if (st.eo.includes(i)) throw bad('owned'); pay(st, cat.ep[i]); st.eo.push(i); }
+  else if (kind === 'effect') { const i = +id; if (!(i >= 1 && i < cat.ep.length) || i === cat.vipef) throw bad('bad_item'); st.eo = st.eo || []; if (st.eo.includes(i)) throw bad('owned'); pay(st, cat.ep[i]); st.eo.push(i); }
   else if (kind === 'booster') { const i = +id, b = cat.bo[i]; if (!b) throw bad('bad_item'); pay(st, b[1]); const same = st.bs && st.bs.k === i + 1 && st.bs.u > now; st.bs = { m: b[0] / 100, k: i + 1, u: (same ? st.bs.u : now) + DAY }; }
   else throw bad('bad_item');
 }
@@ -61,7 +61,16 @@ function runRevive(st, run, free) {
   run.revives = (run.revives || 0) + 1;
 }
 const vipActive = (st, now) => !!st.vip && st.vip > (now || Date.now());
-function fixVip(cat, st, now) { const k = cat.skins[st.skin | 0]; if (k && k.vip && !vipActive(st, now)) st.skin = 0; }
+function fixVip(cat, st, now) { // لما ينتهي الاشتراك تروح مزايا المميز (السكن والتأثير والقبر الملكي)، وألوانه المحفوظة (cc) تبقى محفوظة
+  if (vipActive(st, now)) return;
+  const k = cat.skins[st.skin | 0]; if (k && k.vip) st.skin = 0;
+  if (cat.vipef >= 1 && st.ef === cat.vipef) st.ef = 0;
+  if (st.gsel === 'vg') st.gsel = '🪦';
+}
+function grantAll(cat, st) { // حساب المالك: كل شي مملوك
+  st.own = cat.skins.map((_, i) => i); st.fown = cat.flags.slice(); st.eo = cat.ep.map((_, i) => i).filter(i => i >= 1);
+  st.gown = [...new Set(['🪦', ...cat.graves.map(g => g.e)])]; st.ob = cat.offers.map((_, i) => i); st.vip = Math.max(st.vip || 0, 4102444800000);
+}
 function cleanPicks(cat, st, idx, picks) { // اختيار سكنات العرض: العدد المطلوب بالضبط، من قائمة العرض، وما تملكها
   const of = cat.offers[idx]; if (!of) throw bad('bad_item');
   const own = st.own || [0], avail = of.pool.filter(k => !own.includes(k)), need = Math.min(of.pick, avail.length);
@@ -75,8 +84,13 @@ function prefs(cat, st, b) {
   if (!b.pic) delete st.pic; else if (typeof b.pic === 'string' && b.pic.length < 60000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(b.pic)) st.pic = b.pic;
   if (Number.isInteger(b.skin) && ((st.own || [0]).includes(b.skin) || (cat.skins[b.skin] && cat.skins[b.skin].vip && vipActive(st)))) st.skin = b.skin;
   if (!b.fsk) st.fsk = ''; else if ((st.fown || []).includes(b.fsk)) st.fsk = b.fsk;
-  if (typeof b.gsel === 'string' && (b.gsel === '🪦' || (st.gown || []).includes(b.gsel))) st.gsel = b.gsel;
-  if (Number.isInteger(b.ef) && (b.ef === 0 || (st.eo || []).includes(b.ef))) st.ef = b.ef;
+  if (typeof b.gsel === 'string' && (b.gsel === '🪦' || (b.gsel === 'vg' ? vipActive(st) : (st.gown || []).includes(b.gsel)))) st.gsel = b.gsel;
+  if (Number.isInteger(b.ef) && (b.ef === 0 || (b.ef === cat.vipef ? vipActive(st) : (st.eo || []).includes(b.ef)))) st.ef = b.ef;
+  if (b.cc && typeof b.cc === 'object' && !Array.isArray(b.cc) && vipActive(st)) { // ألوان السكنات المعدّلة (للمميزين فقط، وتنحفظ)
+    const out = {}; let n = 0;
+    for (const k of Object.keys(b.cc)) { const i = +k; if (!Number.isInteger(i) || i < 0 || i >= cat.skins.length || ++n > 60) continue; const a = b.cc[k]; if (Array.isArray(a) && a.length >= 1 && a.length <= 4 && a.every(c => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c))) out[i] = a.map(c => c.toLowerCase()); }
+    st.cc = out;
+  }
 }
 function deliver(cat, st, o) {
   if (o.kind === 'coins') st.coins = (st.coins || 0) + o.item;
@@ -107,4 +121,4 @@ function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمي�
   }
   return map;
 }
-module.exports = { vipActive, fixVip, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+module.exports = { vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };

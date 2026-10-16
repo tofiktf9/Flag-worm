@@ -48,6 +48,7 @@ const GIFT = L.loadHashes(['/etc/secrets', path.join(__dirname, 'data', 'secret'
 console.log('gift codes loaded:', GIFT.size);
 const OWNER = (process.env.OWNER_USER || '').trim().toLowerCase(); // اسم حسابك: يطلع لك لفل 999 (لك أنت بس)
 const isOwner = u => !!OWNER && u.name_lower === OWNER;
+const ownerSync = async u => { if (isOwner(u)) u.state = (await tx(u.id, st => { L.grantAll(CAT, st); })).state; return u; }; // المالك: كل شي مملوك + مميز دائماً
 const withOw = (st, u, now) => { const s = { ...st, ow: isOwner(u) ? 1 : 0 }; L.fixVip(CAT, s, now || Date.now()); return s; };
 const DEF = () => ({ flag: 'DZ', skin: 0, own: [0], coins: 100, xp: 0, best: 0, tot: 0 });
 
@@ -67,6 +68,7 @@ async function tx(uid, fn) {
 const act = (max, fn) => [authm, guard(max), w(async (req, res) => { const { state, out } = await tx(req.u.id, st => fn(st, req)); res.json({ state, ...(out || {}) }); })];
 
 app.get('/healthz', (_, res) => res.send('ok'));
+app.get('/api/status', (_, res) => res.json({ ok: true, giftCodes: GIFT.size })); // افتحه للتأكد إن قائمة الأكواد انحمّلت (لازم > 0)
 
 app.post('/api/register', guard(10), w(async (req, res) => {
   const { name = '', password = '', email = '' } = req.body || {};
@@ -93,10 +95,12 @@ app.post('/api/login', guard(10), w(async (req, res) => {
   if (!u || !sameSig(hh, u.hash)) { f.push(Date.now()); fails.set(k, f); if (fails.size > 20000) fails.clear(); return res.status(401).json({ error: 'bad_login' }); }
   fails.delete(k);
   await q("delete from sessions where created < now() - interval '30 days'");
+  await ownerSync(u);
   res.json({ token: await newSession(u.id), name: u.name, state: withOw(u.state, u) });
 }));
 app.post('/api/logout', authm, w(async (req, res) => { await q('delete from sessions where token=$1', [(req.headers.authorization || '').slice(7)]); res.json({ ok: 1 }); }));
 app.get('/api/me', authm, w(async (req, res) => {
+  await ownerSync(req.u);
   const st = req.u.state || {}, ks = Object.keys(st.codes || {});
   if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ name: req.u.name, state: withOw(s2, req.u), now: Date.now() }); } }
   res.json({ name: req.u.name, state: withOw(st, req.u), now: Date.now() });
@@ -159,6 +163,7 @@ app.post('/api/redeem', ...act(10, async (st, req) => {
       st.coins = (st.coins || 0) + amt; return { coins: amt };
     }
   }
+  if (c && GIFT.size === 0) throw new L.Bad('nocodes'); // قائمة الأكواد ما انحمّلت في السيرفر
   badAdd(ku, ki); throw new L.Bad('invalid');
 }));
 
@@ -274,7 +279,7 @@ server.on('upgrade', (req, socket) => {
 const num = (v, lo, hi) => { v = +v; return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo; };
 const roomFor = () => { let r = ROOMS.find(x => x.peers.size < MAXP); if (!r) { r = { id: ROOMS.length + 1, seed: crypto.randomInt(1, 2147483647), peers: new Map() }; ROOMS.push(r); } return r; };
 const FOODS = ['🍔', '🍉', '🍌', '🍇', '🍎'];
-const infoOf = p => { const st0 = p.st || {}, now = Date.now(), st = { ...st0 }; L.fixVip(CAT, st, now); return { id: p.id, name: p.name, vip: L.vipActive(st, now) ? 1 : 0, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: p.owner ? 999 : L.lvOf(st.xp), av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
+const infoOf = p => { const st0 = p.st || {}, now = Date.now(), st = { ...st0 }; L.fixVip(CAT, st, now); return { id: p.id, name: p.name, vip: L.vipActive(st, now) ? 1 : 0, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: p.owner ? 999 : L.lvOf(st.xp), cc: L.vipActive(st, now) && st.cc && st.cc[st.skin | 0] ? st.cc[st.skin | 0] : null, av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
 const bcast = (room, msg, except) => room.peers.forEach(p => { if (p !== except) p.sock.send(msg); });
 function handleSock(sock) {
   let me = null, cnt = 0, t0 = Date.now();
@@ -288,6 +293,7 @@ function handleSock(sock) {
         if (me) return;
         const r = await q("select u.id,u.name,u.name_lower,u.state from sessions s join users u on u.id=s.user_id where s.token=$1 and s.created > now() - interval '30 days'", [String(m.token || '')]);
         const u = r.rows[0]; if (!u) return sock.close();
+        await ownerSync(u);
         for (const p of PEERS) if (p.uid === u.id) p.sock.close(); // اتصال واحد لكل حساب
         const room = roomFor();
         me = { id: ++PID, uid: u.id, name: u.name, owner: isOwner(u), st: u.state, sock, room, x: 15000, y: 15000, a: 0, g: 0, sc: 0, b: 0, dead: true };

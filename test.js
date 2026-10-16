@@ -29,6 +29,13 @@ t('الاشتراك: يمدّد المدة، وسكن المميزين ما يل
 t('سكن المميزين ما يُشترى بالعملات ولا يدخل العروض', () => { const st = fresh(), vi = cat.skins.findIndex(k => k.vip); st.coins = 1e9; thr(() => L.buy(cat, st, { kind: 'skin', id: vi }, NOW), 'bad_item'); assert(cat.offers.every(o => !o.pool.includes(vi))); });
 t('عرض مدفوع مرتين لا يعطي عملات مرتين', () => { const st = fresh(); L.deliver(cat, st, { kind: 'offer', item: 0 }); const c = st.coins; L.deliver(cat, st, { kind: 'offer', item: 0 }); assert.equal(st.coins, c); });
 t('الإعدادات: لا يمكن لبس شي غير مملوك أو تغيير العملات', () => { const st = fresh(); L.prefs(cat, st, { skin: 40, coins: 99999, fsk: 'DZ', gsel: '⚱️', ef: 3, flag: 'FR', av: '😎' }); assert.equal(st.coins, 100); assert.notEqual(st.skin, 40); assert(!st.fsk); assert.notEqual(st.gsel, '⚱️'); assert.notEqual(st.ef, 3); assert.equal(st.flag, 'FR'); });
+t('المميز: التأثير والقبر الملكي والألوان تنقبل فقط وقت الاشتراك، وتروح بعده وألوانه تبقى محفوظة', () => { const st = fresh(), vi = cat.skins.findIndex(k => k.vip), cc = { [vi]: ['#ff0000', '#00ff00'] };
+  L.prefs(cat, st, { ef: cat.vipef, gsel: 'vg', cc }); assert.notEqual(st.ef, cat.vipef); assert.notEqual(st.gsel, 'vg'); assert(!st.cc);
+  L.deliver(cat, st, { kind: 'vip', item: 1 }); L.prefs(cat, st, { ef: cat.vipef, gsel: 'vg', skin: vi, cc }); assert.equal(st.ef, cat.vipef); assert.equal(st.gsel, 'vg'); assert.equal(st.skin, vi); assert.deepEqual(st.cc[vi], ['#ff0000', '#00ff00']);
+  L.prefs(cat, st, { cc: { 5: ['red'], 6: ['#12345'], 7: [], [vi]: ['#AABBCC'] } }); assert.deepEqual(Object.keys(st.cc), [String(vi)]); assert.deepEqual(st.cc[vi], ['#aabbcc']);
+  st.vip = Date.now() - 1; L.fixVip(cat, st); assert.equal(st.skin, 0); assert.equal(st.ef, 0); assert.equal(st.gsel, '🪦'); assert.deepEqual(st.cc[vi], ['#aabbcc']); L.prefs(cat, st, { cc: { [vi]: ['#000000'] } }); assert.deepEqual(st.cc[vi], ['#aabbcc']); });
+t('تأثير المميز ما يُشترى بالعملات', () => { const st = fresh(); st.coins = 1e9; thr(() => L.buy(cat, st, { kind: 'effect', id: cat.vipef }, NOW), 'bad_item'); });
+t('المالك: كل شي مملوك ومميز دائماً', () => { const st = fresh(); L.grantAll(cat, st); assert.equal(st.own.length, cat.skins.length); assert.equal(st.fown.length, cat.flags.length); assert(st.gown.includes('vg')); assert(L.vipActive(st)); assert.equal(st.eo.length, cat.ep.length - 1); L.prefs(cat, st, { skin: cat.skins.length - 1, ef: cat.vipef, gsel: 'vg' }); assert.equal(st.ef, cat.vipef); });
 (async () => {
   const fs = require('fs'), os = require('os'), path = require('path');
   const code = 'GIFT-KEIO93', h = await L.hashCode(code);
