@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://flag-worm.onrender.com/
+Sitemap: https://flag-worm.onrender.com/sitemap.xml
