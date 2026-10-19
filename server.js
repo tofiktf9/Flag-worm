@@ -19,7 +19,11 @@ async function init0() {
   create table if not exists orders(id serial primary key, user_id int references users(id), kind text not null, item int not null, amount int not null, status text not null default 'pending', checkout_id text unique, created timestamptz default now(), paid_at timestamptz);
   alter table orders add column if not exists picks text; alter table orders add column if not exists provider text; alter table orders add column if not exists usd_cents int;
   create table if not exists used_codes(hash text primary key, user_id int, coins int not null, used_at timestamptz default now());
-  create table if not exists codes(code text primary key, coins int not null, used_by int, used_at timestamptz, created_by int, created timestamptz default now());`);
+  create table if not exists codes(code text primary key, coins int not null, used_by int, used_at timestamptz, created_by int, created timestamptz default now());
+  create table if not exists dms(id bigserial primary key, from_id int not null references users(id) on delete cascade, to_id int not null references users(id) on delete cascade, txt text not null, seen boolean not null default false, created timestamptz default now());
+  create index if not exists dms_pair on dms(least(from_id,to_id), greatest(from_id,to_id), id);
+  create index if not exists dms_to on dms(to_id, seen);
+  create table if not exists boss_state(room int primary key, respawn bigint not null default 0);`);
 }
 async function init() { // لو السيرفر ما يدعم SSL (اتصال داخلي) نعيد المحاولة بدونه
   try { await init0(); } catch (e) { if (wantSsl && /does not support SSL/i.test(e.message)) { pool = mkPool(false); await init0(); } else throw e; }
@@ -79,7 +83,7 @@ app.post('/api/register', guard(10), w(async (req, res) => {
   const salt = crypto.randomBytes(16).toString('hex');
   try {
     const r = await q('insert into users(name,name_lower,email,salt,hash,state) values($1,$2,$3,$4,$5,$6) returning id', [n, n.toLowerCase(), e || null, salt, await hash(password, salt), DEF()]);
-    res.json({ token: await newSession(r.rows[0].id), name: n, state: withOw(DEF(), { name_lower: n.toLowerCase() }) });
+    res.json({ token: await newSession(r.rows[0].id), id: r.rows[0].id, name: n, state: withOw(DEF(), { name_lower: n.toLowerCase() }) });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: /email/.test(err.detail || '') ? 'email_taken' : 'name_taken' });
     throw err;
@@ -96,14 +100,14 @@ app.post('/api/login', guard(10), w(async (req, res) => {
   fails.delete(k);
   await q("delete from sessions where created < now() - interval '30 days'");
   await ownerSync(u);
-  res.json({ token: await newSession(u.id), name: u.name, state: withOw(u.state, u) });
+  res.json({ token: await newSession(u.id), id: u.id, name: u.name, state: withOw(u.state, u) });
 }));
 app.post('/api/logout', authm, w(async (req, res) => { await q('delete from sessions where token=$1', [(req.headers.authorization || '').slice(7)]); res.json({ ok: 1 }); }));
 app.get('/api/me', authm, w(async (req, res) => {
   await ownerSync(req.u);
   const st = req.u.state || {}, ks = Object.keys(st.codes || {});
-  if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ name: req.u.name, state: withOw(s2, req.u), now: Date.now() }); } }
-  res.json({ name: req.u.name, state: withOw(st, req.u), now: Date.now() });
+  if (ks.length) { const r = await q('select code from codes where code = any($1) and used_by is not null', [ks]); if (r.rows.length) { const s2 = { ...st, codes: { ...st.codes } }; for (const x of r.rows) delete s2.codes[x.code]; return res.json({ id: req.u.id, name: req.u.name, state: withOw(s2, req.u), now: Date.now() }); } }
+  res.json({ id: req.u.id, name: req.u.name, state: withOw(st, req.u), now: Date.now() });
 }));
 
 // ===== الاقتصاد: كله هنا في السيرفر (العميل ما يقدر يعدّل العملات أو المشتريات) =====
@@ -277,14 +281,79 @@ server.on('upgrade', (req, socket) => {
   socket.setNoDelay(true); handleSock(new Sock(socket));
 });
 const num = (v, lo, hi) => { v = +v; return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo; };
-const roomFor = () => { let r = ROOMS.find(x => x.peers.size < MAXP); if (!r) { r = { id: ROOMS.length + 1, seed: crypto.randomInt(1, 2147483647), peers: new Map() }; ROOMS.push(r); } return r; };
+// ===== الزعيم: واحد لكل غرفة، في مربع وسط الخريطة. إذا انقتل يرجع بعد ساعة (الوقت محفوظ في القاعدة) =====
+const BOSS = { HP: 1500, CX: 15000, CY: 15000, AR: 1800, RESPAWN: 36e5, LEN: 160 };
+const bossSpawn = room => { room.boss = { alive: true, hp: BOSS.HP, x: BOSS.CX, y: BOSS.CY, a: 0, ta: 0, k: 0, stun: 0, dmg: new Map(), respawn: 0 }; };
+const bossInfo = room => { const b = room.boss; return b ? { al: b.alive ? 1 : 0, hp: Math.max(0, Math.round(b.hp)), max: BOSS.HP, in: b.alive ? 0 : Math.max(0, b.respawn - Date.now()) } : null; };
+async function bossLoad(room) {
+  try { const r = await q('select respawn from boss_state where room=$1', [room.id]); const t = r.rows[0] ? +r.rows[0].respawn : 0;
+    if (t > Date.now()) room.boss = { alive: false, hp: 0, respawn: t, dmg: new Map() }; else bossSpawn(room);
+  } catch (e) { console.error('boss load', e); bossSpawn(room); }
+  bcast(room, { t: 'boss', b: bossInfo(room) });
+}
+function bossTick(room) {
+  const b = room.boss; if (!b) return;
+  if (!b.alive) { if (Date.now() >= b.respawn) { bossSpawn(room); bcast(room, { t: 'boss', b: bossInfo(room), sp: 1 }); } return; }
+  let t = null, td = 1e18; // يطارد أقرب لاعب داخل مربعه
+  for (const p of room.peers.values()) { if (p.dead || Math.abs(p.x - BOSS.CX) > BOSS.AR + 300 || Math.abs(p.y - BOSS.CY) > BOSS.AR + 300) continue; const d = (p.x - b.x) ** 2 + (p.y - b.y) ** 2; if (d < td) { td = d; t = p; } }
+  if (b.stun > 0) b.stun--;
+  else if (t) b.ta = Math.atan2(t.y - b.y, t.x - b.x);
+  else if (--b.k <= 0) { b.k = 20 + crypto.randomInt(0, 40); b.ta = b.a + (Math.random() - .5) * 2.4; }
+  if (Math.abs(b.x - BOSS.CX) > BOSS.AR - 200 || Math.abs(b.y - BOSS.CY) > BOSS.AR - 200) b.ta = Math.atan2(BOSS.CY - b.y, BOSS.CX - b.x);
+  const d = ((b.ta - b.a + Math.PI * 3) % (Math.PI * 2)) - Math.PI; b.a += Math.max(-.2, Math.min(.2, d));
+  const sp = t && td < 9e5 ? 7.6 : 5.4; // أسرع شوي من اللاعب العادي وأبطأ من التسريع
+  b.x = Math.min(BOSS.CX + BOSS.AR - 40, Math.max(BOSS.CX - BOSS.AR + 40, b.x + Math.cos(b.a) * sp));
+  b.y = Math.min(BOSS.CY + BOSS.AR - 40, Math.max(BOSS.CY - BOSS.AR + 40, b.y + Math.sin(b.a) * sp));
+}
+async function bossKill(room, killer) {
+  const b = room.boss; b.alive = false; b.hp = 0; b.respawn = Date.now() + BOSS.RESPAWN;
+  q('insert into boss_state(room,respawn) values($1,$2) on conflict(room) do update set respawn=$2', [room.id, b.respawn]).catch(e => console.error('boss save', e));
+  bcast(room, { t: 'boss', b: bossInfo(room), by: killer.name });
+  const tot = [...b.dmg.values()].reduce((x, y) => x + y, 0) || 1;
+  for (const [uid, d] of b.dmg) { // الجائزة: حسب الضرر، والقاتل ياخذ 500 زيادة
+    const coins = Math.round(50 + 1950 * d / tot) + (uid === killer.uid ? 500 : 0);
+    try { await tx(uid, st => { st.coins = (st.coins || 0) + coins; }); const p = peerOf(uid); if (p) p.sock.send({ t: 'breward', c: coins }); } catch (e) { console.error('boss reward', e); }
+  }
+  b.dmg = new Map();
+}
+
+// ===== البارتي (مجموعة أصحاب يشوفون مكان بعض ويتكلمون) =====
+const PARTY = new Map(), PARTY_OF = new Map(), INV = new Map(), MAXPT = 6; let PTID = 0;
+const peerOf = uid => { for (const p of PEERS) if (p.uid === uid) return p; return null; };
+const clean = t => String(t || '').replace(/[\u0000-\u001f\u007f‪-‮⁦-⁩]/g, ' ').trim().slice(0, 200);
+function partySend(P) {
+  const m = [...P.m].map(uid => { const p = peerOf(uid); return { uid, name: P.names.get(uid), on: p ? 1 : 0 }; });
+  for (const uid of P.m) { const p = peerOf(uid); if (p) p.sock.send({ t: 'party', id: P.id, lead: P.lead, m }); }
+}
+function partyLeave(uid) {
+  const P = PARTY.get(PARTY_OF.get(uid)); PARTY_OF.delete(uid); if (!P) return;
+  P.m.delete(uid); const p = peerOf(uid); if (p) p.sock.send({ t: 'party', id: 0, m: [] });
+  if (P.m.size < 2) { for (const u of P.m) { PARTY_OF.delete(u); const q2 = peerOf(u); if (q2) q2.sock.send({ t: 'party', id: 0, m: [], gone: 1 }); } PARTY.delete(P.id); return; }
+  if (P.lead === uid) P.lead = [...P.m][0];
+  partySend(P);
+}
+function partyJoin(inviter, me) {
+  let P = PARTY.get(PARTY_OF.get(inviter.uid));
+  if (P && P.m.has(me.uid)) return;
+  if (P && P.m.size >= MAXPT) return me.sock.send({ t: 'sys', k: 'party_full' });
+  if (PARTY_OF.has(me.uid)) partyLeave(me.uid);
+  if (!P) { P = { id: ++PTID, lead: inviter.uid, m: new Set([inviter.uid]), names: new Map([[inviter.uid, inviter.name]]) }; PARTY.set(P.id, P); PARTY_OF.set(inviter.uid, P.id); }
+  P.m.add(me.uid); P.names.set(me.uid, me.name); PARTY_OF.set(me.uid, P.id); partySend(P);
+}
+
+const roomFor = pref => {
+  if (pref && pref.peers.size < MAXP) return pref;
+  let r = ROOMS.find(x => x.peers.size < MAXP);
+  if (!r) { r = { id: ROOMS.length + 1, seed: crypto.randomInt(1, 2147483647), peers: new Map(), log: [], boss: null }; ROOMS.push(r); bossLoad(r); }
+  return r;
+};
 const FOODS = ['🍔', '🍉', '🍌', '🍇', '🍎'];
-const infoOf = p => { const st0 = p.st || {}, now = Date.now(), st = { ...st0 }; L.fixVip(CAT, st, now); return { id: p.id, name: p.name, vip: L.vipActive(st, now) ? 1 : 0, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: p.owner ? 999 : L.lvOf(st.xp), cc: L.vipActive(st, now) && st.cc && st.cc[st.skin | 0] ? st.cc[st.skin | 0] : null, av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
+const infoOf = p => { const st0 = p.st || {}, now = Date.now(), st = { ...st0 }; L.fixVip(CAT, st, now); return { id: p.id, u: p.uid, name: p.name, vip: L.vipActive(st, now) ? 1 : 0, flag: st.flag || 'DZ', skin: st.skin | 0, fk: st.fsk || '', lvl: p.owner ? 999 : L.lvOf(st.xp), cc: L.vipActive(st, now) && st.cc && st.cc[st.skin | 0] ? st.cc[st.skin | 0] : null, av: String(st.av || '').slice(0, 4), bx: st.bs && Date.now() < st.bs.u ? st.bs.k : 0, x: Math.round(p.x), y: Math.round(p.y), dead: p.dead }; };
 const bcast = (room, msg, except) => room.peers.forEach(p => { if (p !== except) p.sock.send(msg); });
 function handleSock(sock) {
-  let me = null, cnt = 0, t0 = Date.now();
+  let me = null, cnt = 0, t0 = Date.now(), lastChat = 0, lastEmo = 0, lastHit = 0;
   const timer = setTimeout(() => { if (!me) sock.close(); }, 5000);
-  sock.onclose = () => { clearTimeout(timer); if (me) { me.room.peers.delete(me.id); PEERS.delete(me); bcast(me.room, { t: 'leave', id: me.id }); } };
+  sock.onclose = () => { clearTimeout(timer); if (me) { me.room.peers.delete(me.id); PEERS.delete(me); bcast(me.room, { t: 'leave', id: me.id }); const P = PARTY.get(PARTY_OF.get(me.uid)); if (P) setTimeout(() => partySend(P), 50); } };
   sock.onmsg = async raw => {
     if (Date.now() - t0 > 1000) { t0 = Date.now(); cnt = 0; } if (++cnt > 80) return sock.close();
     let m; try { m = JSON.parse(raw); } catch (e) { return; }
@@ -295,11 +364,14 @@ function handleSock(sock) {
         const u = r.rows[0]; if (!u) return sock.close();
         await ownerSync(u);
         for (const p of PEERS) if (p.uid === u.id) p.sock.close(); // اتصال واحد لكل حساب
-        const room = roomFor();
+        const P = PARTY.get(PARTY_OF.get(u.id)); let pref = null; // ندخلك نفس غرفة أصحابك في البارتي
+        if (P) for (const uid of P.m) { const x = peerOf(uid); if (x && uid !== u.id) { pref = x.room; break; } }
+        const room = roomFor(pref);
         me = { id: ++PID, uid: u.id, name: u.name, owner: isOwner(u), st: u.state, sock, room, x: 15000, y: 15000, a: 0, g: 0, sc: 0, b: 0, dead: true };
         room.peers.set(me.id, me); PEERS.add(me);
-        sock.send({ t: 'welcome', id: me.id, seed: room.seed, peers: [...room.peers.values()].filter(p => p !== me).map(infoOf) });
-        bcast(room, { t: 'join', p: infoOf(me) }, me); return;
+        sock.send({ t: 'welcome', id: me.id, uid: me.uid, seed: room.seed, peers: [...room.peers.values()].filter(p => p !== me).map(infoOf), boss: bossInfo(room), log: room.log });
+        bcast(room, { t: 'join', p: infoOf(me) }, me);
+        if (P) partySend(P); return;
       }
       if (!me) return;
       if (m.t === 's') { me.x = num(m.x, 0, 30000); me.y = num(m.y, 0, 30000); me.a = num(m.a, -10, 10); me.g = num(m.g, 0, 5000); me.sc = num(m.sc, 0, 1e6); me.b = m.b ? 1 : 0; }
@@ -307,11 +379,80 @@ function handleSock(sock) {
       else if (m.t === 'drop' && Array.isArray(m.items)) { const items = m.items.slice(0, 200).filter(i => Array.isArray(i) && FOODS.includes(i[2])).map(i => [num(i[0], 0, 30000), num(i[1], 0, 30000), i[2], num(i[3], 0, 10), num(i[4], 0, 10)]); if (items.length) bcast(me.room, { t: 'drop', items }, me); }
       else if (m.t === 'die') { if (me.dead) return; me.dead = true; bcast(me.room, { t: 'dead', id: me.id }, me); const k = me.room.peers.get(+m.by | 0); if (k && k !== me && !k.dead) k.sock.send({ t: 'kill', x: num(m.x, 0, 30000), y: num(m.y, 0, 30000), name: me.name }); }
       else if (m.t === 'alive') { if (!me.dead) return; const r = await q('select state from users where id=$1', [me.uid]); if (r.rows[0]) me.st = r.rows[0].state; me.dead = false; me.x = num(m.x, 0, 30000) || me.x; me.y = num(m.y, 0, 30000) || me.y; bcast(me.room, { t: 'join', p: infoOf(me) }, me); }
+      else if (m.t === 'bhit') { // راس الزعيم صدم جسم اللاعب: ينقص من دمه
+        const b = me.room.boss, now = Date.now(), g = num(m.g, 0, 5000);
+        if (!b || !b.alive || me.dead || now - lastHit < 500) return;
+        if (Math.hypot(me.x - b.x, me.y - b.y) > 7 * (12 + g) + 500) return;
+        lastHit = now; const dmg = Math.round(10 + Math.min(30, g / 10));
+        b.hp -= dmg; b.dmg.set(me.uid, (b.dmg.get(me.uid) || 0) + dmg); b.ta = b.a + Math.PI; b.stun = 12;
+        bcast(me.room, { t: 'bhurt', id: me.id, d: dmg, hp: Math.max(0, b.hp) });
+        if (b.hp <= 0) await bossKill(me.room, me);
+      }
+      else if (m.t === 'chat') { // دردشة عامة (الغرفة) أو دردشة البارتي
+        const txt = clean(m.txt), now = Date.now(); if (!txt || now - lastChat < 700) return; lastChat = now;
+        const msg = { t: 'chat', ch: m.ch === 'p' ? 'p' : 'g', uid: me.uid, name: me.name, f: (me.st || {}).flag || 'DZ', txt, ts: now };
+        if (msg.ch === 'g') { me.room.log.push(msg); if (me.room.log.length > 30) me.room.log.shift(); bcast(me.room, msg); }
+        else { const P = PARTY.get(PARTY_OF.get(me.uid)); if (!P) return sock.send({ t: 'sys', k: 'no_party' }); for (const uid of P.m) { const p = peerOf(uid); if (p) p.sock.send(msg); } }
+      }
+      else if (m.t === 'emo') { const e = num(m.e, 0, L.EMOJIS.length - 1) | 0, now = Date.now(); if (now - lastEmo < 800) return; lastEmo = now; bcast(me.room, { t: 'emo', id: me.id, e }); }
+      else if (m.t === 'pinv') {
+        const to = +m.to | 0, p = peerOf(to);
+        if (to === me.uid) return;
+        if (!p) return sock.send({ t: 'sys', k: 'offline' });
+        const P = PARTY.get(PARTY_OF.get(me.uid));
+        if (P && P.m.has(to)) return sock.send({ t: 'sys', k: 'already' });
+        if (P && P.m.size >= MAXPT) return sock.send({ t: 'sys', k: 'party_full' });
+        const a = INV.get(to) || new Map(); a.set(me.uid, Date.now()); INV.set(to, a); if (INV.size > 5000) INV.clear();
+        p.sock.send({ t: 'pinv', from: me.uid, name: me.name }); sock.send({ t: 'sys', k: 'inv_sent', name: p.name });
+      }
+      else if (m.t === 'pacc') {
+        const from = +m.from | 0, a = INV.get(me.uid), ts = a && a.get(from); if (a) a.delete(from);
+        if (!ts || Date.now() - ts > 5 * 60000) return sock.send({ t: 'sys', k: 'inv_expired' });
+        const p = peerOf(from); if (!p) return sock.send({ t: 'sys', k: 'offline' });
+        partyJoin(p, me);
+      }
+      else if (m.t === 'pleave') partyLeave(me.uid);
     } catch (e) { console.error('ws', e); }
   };
 }
-setInterval(() => { for (const room of ROOMS) { if (room.peers.size < 2) continue; const arr = [...room.peers.values()].filter(p => !p.dead).map(p => [p.id, Math.round(p.x), Math.round(p.y), +p.a.toFixed(2), Math.floor(p.g), Math.floor(p.sc), p.b]); bcast(room, { t: 'snap', p: arr }); } }, 50).unref(); // 20 تحديث بالثانية
+setInterval(() => { for (const room of ROOMS) { if (!room.peers.size) continue; bossTick(room); const b = room.boss, arr = [...room.peers.values()].filter(p => !p.dead).map(p => [p.id, Math.round(p.x), Math.round(p.y), +p.a.toFixed(2), Math.floor(p.g), Math.floor(p.sc), p.b]); bcast(room, { t: 'snap', p: arr, b: b && b.alive ? [Math.round(b.x), Math.round(b.y), +b.a.toFixed(2), Math.max(0, Math.round(b.hp))] : null }); } }, 50).unref(); // 20 تحديث بالثانية
+setInterval(() => { for (const P of PARTY.values()) { // مكان أعضاء البارتي (للخريطة الصغيرة) مرتين بالثانية
+  const pos = []; for (const uid of P.m) { const p = peerOf(uid); if (p) pos.push([uid, Math.round(p.x), Math.round(p.y), p.dead ? 0 : 1, p.room.id]); }
+  if (!pos.length) { for (const uid of P.m) PARTY_OF.delete(uid); PARTY.delete(P.id); continue; } // الكل طلع: نحذف البارتي
+  for (const uid of P.m) { const p = peerOf(uid); if (p) p.sock.send({ t: 'ppos', m: pos }); }
+} }, 500).unref();
 setInterval(() => { for (const p of PEERS) { if (!p.sock.alive) p.sock.close(); else { p.sock.alive = false; p.sock.ping(); } } }, 25000).unref();
+
+// ===== الرسائل الخاصة (بالـID تبع الحساب، تنحفظ في القاعدة وتوصل حتى لو صاحبك أوفلاين) =====
+app.get('/api/user/:id', authm, guard(60), w(async (req, res) => {
+  const r = await q("select id, name, state->>'flag' as flag from users where id=$1", [+req.params.id | 0]);
+  if (!r.rows[0]) return res.status(404).json({ error: 'no_user' });
+  res.json({ ...r.rows[0], on: peerOf(r.rows[0].id) ? 1 : 0 });
+}));
+app.get('/api/dm', authm, guard(60), w(async (req, res) => {
+  const me = req.u.id;
+  const r = await q(`select distinct on (o) o, txt, from_id, created, id from (select case when from_id=$1 then to_id else from_id end as o, txt, from_id, created, id from dms where from_id=$1 or to_id=$1) t order by o, id desc`, [me]);
+  const ids = r.rows.map(x => x.o);
+  const [nm, un] = await Promise.all([q("select id, name, state->>'flag' as flag from users where id = any($1)", [ids]), q('select from_id, count(*)::int n from dms where to_id=$1 and not seen group by from_id', [me])]);
+  const N = new Map(nm.rows.map(x => [x.id, x])), U = new Map(un.rows.map(x => [x.from_id, x.n]));
+  const rows = r.rows.filter(x => N.has(x.o)).sort((a, b) => b.id - a.id).slice(0, 50).map(x => ({ uid: x.o, name: N.get(x.o).name, flag: N.get(x.o).flag, txt: x.txt, mine: x.from_id === me ? 1 : 0, ts: +new Date(x.created), un: U.get(x.o) || 0, on: peerOf(x.o) ? 1 : 0 }));
+  res.json({ rows });
+}));
+app.get('/api/dm/:id', authm, guard(120), w(async (req, res) => {
+  const me = req.u.id, o = +req.params.id | 0;
+  const r = await q('select from_id, txt, created from dms where (from_id=$1 and to_id=$2) or (from_id=$2 and to_id=$1) order by id desc limit 60', [me, o]);
+  await q('update dms set seen=true where to_id=$1 and from_id=$2 and not seen', [me, o]);
+  res.json({ rows: r.rows.reverse().map(x => ({ mine: x.from_id === me ? 1 : 0, txt: x.txt, ts: +new Date(x.created) })) });
+}));
+app.post('/api/dm/:id', authm, guard(20), w(async (req, res) => {
+  const me = req.u, o = +req.params.id | 0, txt = clean((req.body || {}).txt);
+  if (!txt) return res.status(400).json({ error: 'empty' });
+  if (o === me.id) return res.status(400).json({ error: 'self' });
+  const u = await q('select id from users where id=$1', [o]); if (!u.rows[0]) return res.status(404).json({ error: 'no_user' });
+  const r = await q('insert into dms(from_id,to_id,txt) values($1,$2,$3) returning created', [me.id, o, txt]);
+  const p = peerOf(o); if (p) p.sock.send({ t: 'dm', uid: me.id, name: me.name, f: (me.state || {}).flag || 'DZ', txt, ts: +new Date(r.rows[0].created) });
+  res.json({ ok: 1 });
+}));
 app.get('/api/online', (_, res) => res.json({ n: PEERS.size }));
 
 const PORT = process.env.PORT || 3000;

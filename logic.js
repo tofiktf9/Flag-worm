@@ -78,7 +78,10 @@ function cleanPicks(cat, st, idx, picks) { // اختيار سكنات العرض
   if (p.length !== need || !p.every(k => avail.includes(k))) throw bad('bad_picks');
   return p;
 }
+// الإيموجيات المسموحة في الدردشة وفوق الدودة (نفس الترتيب في public/index.html: EMJ)
+const EMOJIS = ['😀','😂','🤣','😍','😎','🥳','😭','😡','😱','🤔','😴','🤯','👍','👎','👏','🙏','💪','🔥','💯','❤️','💔','👑','💀','👻','🤡','🐍','🎉','⚔️','🛡️','🏃','🆘','👋','🤝','✌️','👀','🍔','💎','⭐','👹','🏆'];
 function prefs(cat, st, b) {
+  if (Array.isArray(b.emo) && b.emo.length === 9 && b.emo.every(x => EMOJIS.includes(x))) st.emo = b.emo.slice(); // ترتيب الإيموجيات على الأرقام 1-9
   if (typeof b.flag === 'string' && cat.flags.includes(b.flag)) st.flag = b.flag;
   if (typeof b.av === 'string') st.av = b.av.slice(0, 4);
   if (!b.pic) delete st.pic; else if (typeof b.pic === 'string' && b.pic.length < 60000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(b.pic)) st.pic = b.pic;
@@ -121,4 +124,4 @@ function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمي�
   }
   return map;
 }
-module.exports = { vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+module.exports = { EMOJIS, vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };

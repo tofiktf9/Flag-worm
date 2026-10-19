@@ -1,0 +1,5 @@
+# اللعبة الحقيقية تشتغل على Render (سيرفر Node + WebSocket). هنا ننشر الواجهة فقط
+# حتى ما تنكشف ملفات السيرفر أو بصمات الأكواد (data/secret).
+[build]
+  publish = "public"
+  command = ""
