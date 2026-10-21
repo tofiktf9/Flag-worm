@@ -24,7 +24,56 @@ function buy(cat, st, { kind, id }, now) {
   else if (kind === 'booster') { const i = +id, b = cat.bo[i]; if (!b) throw bad('bad_item'); pay(st, b[1]); const same = st.bs && st.bs.k === i + 1 && st.bs.u > now; st.bs = { m: b[0] / 100, k: i + 1, u: (same ? st.bs.u : now) + DAY }; }
   else throw bad('bad_item');
 }
-function daily(st, now) { if (st.gt && now < st.gt) throw bad('cooldown'); st.coins = (st.coins || 0) + 100; st.gt = now + DAY; }
+// ===== إحصائيات اللاعب والإنجازات (تُحسب في السيرفر فقط)
+const ST0 = () => ({ k: 0, d: 0, w: 0, pt: 0, runs: 0, bs: 0, kt: 0, ch: 0, bk: 0 });
+const statsOf = st => st.stats || (st.stats = ST0());
+const ACH = [
+  { id: 'k1', n: 'أول ضحية', d: 'اقتل لاعباً', r: 50, f: s => s.stats.k >= 1 },
+  { id: 'k10', n: 'صياد', d: 'اقتل 10 لاعبين', r: 200, f: s => s.stats.k >= 10 },
+  { id: 'k100', n: 'جزّار', d: 'اقتل 100 لاعب', r: 1500, f: s => s.stats.k >= 100 },
+  { id: 's1000', n: 'ألف نقطة', d: 'نتيجة 1000 في جولة', r: 100, f: s => s.stats.bs >= 1000 },
+  { id: 's5000', n: 'خمسة آلاف', d: 'نتيجة 5000 في جولة', r: 400, f: s => s.stats.bs >= 5000 },
+  { id: 's20000', n: 'أسطورة', d: 'نتيجة 20000 في جولة', r: 1500, f: s => s.stats.bs >= 20000 },
+  { id: 'king1', n: 'ملك الساحة', d: 'احكم دقيقة كاملة', r: 150, f: s => s.stats.kt >= 60 },
+  { id: 'king30', n: 'عرش طويل', d: 'احكم 30 دقيقة (مجموع)', r: 1200, f: s => s.stats.kt >= 1800 },
+  { id: 'ch1', n: 'صائد الكنوز', d: 'اجمع صندوقاً نادراً', r: 100, f: s => s.stats.ch >= 1 },
+  { id: 'ch10', n: 'جامع الكنوز', d: 'اجمع 10 صناديق', r: 800, f: s => s.stats.ch >= 10 },
+  { id: 'bk1', n: 'قاتل الزعيم', d: 'اقتل الزعيم', r: 500, f: s => s.stats.bk >= 1 },
+  { id: 'str7', n: 'وفي', d: 'حضور 7 أيام متتالية', r: 300, f: s => (s.sk || 0) >= 7 },
+  { id: 'pt1', n: 'مدمن', d: 'العب ساعة (مجموع)', r: 200, f: s => s.stats.pt >= 3600 },
+  { id: 'w1', n: 'منتصر', d: 'فز بجولة (كن الملك)', r: 200, f: s => s.stats.w >= 1 },
+  { id: 'lv10', n: 'مستوى 10', d: 'وصل المستوى 10', r: 300, f: s => lvOf(s.xp) >= 10 },
+];
+function checkAch(st, now) { statsOf(st); st.ach = st.ach || {}; const out = []; for (const a of ACH) if (!st.ach[a.id] && a.f(st)) { st.ach[a.id] = now; st.coins = (st.coins || 0) + a.r; out.push(a.id); } return out; }
+const weekOf = now => Math.floor((now / DAY + 3) / 7); // الأسبوع يبدأ الاثنين (UTC)
+const SEASON = [{ max: 1, coins: 3000, title: '👑 ملك الأسبوع' }, { max: 2, coins: 2000, title: '🥈 فضي الأسبوع' }, { max: 3, coins: 1200, title: '🥉 برونزي الأسبوع' }, { max: 10, coins: 400, title: '⭐ نخبة الأسبوع' }];
+const seasonReward = rank => SEASON.find(x => rank >= 1 && rank <= x.max) || null;
+function grantSeason(st, rank) { const r = seasonReward(rank); if (!r) throw bad('no_reward'); st.coins = (st.coins || 0) + r.coins; st.titles = st.titles || []; if (!st.titles.includes(r.title)) st.titles.push(r.title); if (!st.tt) st.tt = r.title; return r; }
+// ملك الساحة: كل دقيقة حكم = 15 عملة (سقف 600 يومياً) + 30 خبرة، ومكافأة 150 عند 5 دقايق في نفس الحكم
+function kingPay(st, now, bonus) {
+  if (now > (st.kT || 0)) { st.kT = now + DAY; st.kDay = 0; }
+  const want = bonus ? 150 : 15, add = Math.max(0, Math.min(want, 600 - (st.kDay || 0)));
+  st.kDay = (st.kDay || 0) + add; st.coins = (st.coins || 0) + add; if (!bonus) { st.xp = (st.xp || 0) + 30; statsOf(st).kt += 60; }
+  return add;
+}
+function chestGrant(cat, st, kind, amount, pick) { // صندوق نادر: عملات أو شاهد قبر تجميلي حصري (لو ما تملكه)
+  statsOf(st).ch++;
+  if (kind === 'cosmetic') {
+    st.gown = st.gown || ['🪦']; const left = cat.graves.filter(g => g.c && !st.gown.includes(g.e));
+    if (left.length) { const g = left[Math.min(left.length - 1, Math.floor(pick * left.length))]; st.gown.push(g.e); return { item: g.e }; }
+  }
+  st.coins = (st.coins || 0) + amount; return { coins: amount };
+}
+const DAILY7 = [100, 150, 200, 300, 400, 600, 1500]; // مكافآت 7 أيام (اليوم 7 يعطي وسام وفاء حصري)
+function daily(st, now) {
+  if (st.gt && now < st.gt) throw bad('cooldown'); // نفس المنع القديم: مرة كل 24 ساعة (الوقت من السيرفر فقط)
+  st.sk = (st.dl && now - st.dl <= 2 * DAY) ? (st.sk || 0) + 1 : 1; // تفوت أكثر من يومين تبدأ من جديد
+  st.dl = now; st.gt = now + DAY;
+  const idx = (st.sk - 1) % 7, coins = DAILY7[idx]; let item = null;
+  st.coins = (st.coins || 0) + coins;
+  if (idx === 6) { st.gown = st.gown || ['🪦']; if (!st.gown.includes('🎖️')) { st.gown.push('🎖️'); item = '🎖️'; } }
+  return { coins, day: idx + 1, streak: st.sk, item, ach: checkAch(st, now) };
+}
 function spin(cat, st, now, r) {
   if (st.wt && now < st.wt) throw bad('cooldown');
   let x = r * 100, i = 0; while (i < cat.wp.length - 1 && x >= cat.ww[i]) { x -= cat.ww[i]; i++; }
@@ -45,9 +94,11 @@ function runEnd(st, run, score, now, bags) {
   const l1 = lvOf(st.xp), bonus = 50 * (l1 - l0);
   const room = dayRoom(st, now), add = Math.min(co + bagCo + bonus, room);
   st.rcDay = (st.rcDay || 0) + add; st.coins = (st.coins || 0) + add;
+  const S0 = statsOf(st), playT = Math.min(Math.floor(el), 3600); S0.runs++; S0.pt += ok ? playT : 0; if (sc > S0.bs) S0.bs = sc;
+  if (ok) { const su = st.su || (st.su = {}), k = st.skin | 0; su[k] = (su[k] || 0) + playT; }
   const record = sc > (st.best || 0); if (record) st.best = sc;
   run.lastCo = Math.min(co, add); run.bonusUsed = false;
-  return { score: sc, coins: co, bagCo, xp, levelUp: l1 > l0 ? l1 : 0, bonus, record, capped: add < co + bagCo + bonus };
+  return { delta, ach: checkAch(st, now), score: sc, coins: co, bagCo, xp, levelUp: l1 > l0 ? l1 : 0, bonus, record, capped: add < co + bagCo + bonus };
 }
 function runBonus(st, run, now) {
   if (!run.lastCo || run.bonusUsed) throw bad('no_bonus');
@@ -86,6 +137,8 @@ function prefs(cat, st, b) {
   if (!b.fsk) st.fsk = ''; else if ((st.fown || []).includes(b.fsk)) st.fsk = b.fsk;
   if (typeof b.gsel === 'string' && (b.gsel === '🪦' || (b.gsel === 'vg' ? vipActive(st) : (st.gown || []).includes(b.gsel)))) st.gsel = b.gsel;
   if (Number.isInteger(b.ef) && (b.ef === 0 || (b.ef === cat.vipef ? vipActive(st) : (st.eo || []).includes(b.ef)))) st.ef = b.ef;
+  if (Array.isArray(b.em) && b.em.length === 9 && b.em.every(n => Number.isInteger(n) && n >= 1 && n <= EMOJIS.length)) st.em = b.em.slice();
+  if (typeof b.tt === 'string' && (b.tt === '' || (st.titles || []).includes(b.tt))) st.tt = b.tt;
   if (b.cc && typeof b.cc === 'object' && !Array.isArray(b.cc) && vipActive(st)) { // ألوان السكنات المعدّلة (للمميزين فقط، وتنحفظ)
     const out = {}; let n = 0;
     for (const k of Object.keys(b.cc)) { const i = +k; if (!Number.isInteger(i) || i < 0 || i >= cat.skins.length || ++n > 60) continue; const a = b.cc[k]; if (Array.isArray(a) && a.length >= 1 && a.length <= 4 && a.every(c => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c))) out[i] = a.map(c => c.toLowerCase()); }
@@ -109,6 +162,10 @@ function deliver(cat, st, o) {
 const SALT = 'flag-worm-gift-v1', ITER = 150000;
 const normCode = s => { const m = /^GIFT([A-Z0-9]{6})$/.exec(String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')); return m ? 'GIFT-' + m[1] : null; };
 const hashCode = code => new Promise((ok, no) => crypto.pbkdf2(code, SALT, ITER, 32, 'sha256', (e, k) => e ? no(e) : ok(k.toString('hex').slice(0, 16))));
+function addHashModule(map, obj) { // أكواد جاهزة مضمّنة في ملف giftcodes.js: { 500: 'hash16hash16...', 1500: '...' }
+  for (const k of Object.keys(obj || {})) { const amt = +k; if (!(amt >= 1 && amt <= 100000)) continue; const str = String(obj[k]); for (let i = 0; i + 16 <= str.length; i += 16) { const h = str.slice(i, i + 16); if (/^[0-9a-f]{16}$/.test(h)) map.set(h, amt); } }
+  return map;
+}
 function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمية من اسم الملف) من أماكن سرّية مثل /etc/secrets على Render
   const fs = require('fs'), path = require('path'), map = new Map();
   for (const dir of dirs) {
@@ -121,4 +178,5 @@ function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمي�
   }
   return map;
 }
-module.exports = { vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+const EMOJIS = ["😀", "😂", "🤣", "😍", "😎", "😭", "😡", "🥳", "😱", "🤔", "👍", "👎", "👏", "🙏", "💪", "🔥", "⭐", "❤️", "💔", "💀", "👑", "🏆", "🎉", "🎁", "💰", "🪙", "⚡", "🌈", "☀️", "🌙", "🍎", "🍌", "🍇", "🍉", "🍔", "🍕", "🐍", "🐛", "🦖", "🐉", "👹", "👻", "🤖", "😈", "😇", "🤡", "🥶", "🥵", "😴", "🤯", "😏", "😜", "🤫", "🤝", "👋", "✌️", "🫡", "🫶", "💯", "✅", "❌", "⚠️", "🎯", "🚀", "🛡️", "🧲", "⚔️", "🔪", "💣", "🧨", "🏳️", "🇩🇿", "🇵🇸", "🇸🇦", "🇪🇬", "🇲🇦", "🇹🇳", "🇮🇶", "🤩", "😅"]; // إيموجي مرقّمة 1..80 (اكتب :12: في الدردشة)
+module.exports = { EMOJIS, statsOf, ACH, checkAch, weekOf, SEASON, seasonReward, grantSeason, kingPay, chestGrant, DAILY7, addHashModule, vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
