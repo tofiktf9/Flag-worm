@@ -1,9 +1,9 @@
 'use strict';
 // الزعيم: دودة عملاقة يتحكم فيها السيرفر. يموت بعد 12 ضربة (ضربة = رأسه يلمس جسم لاعب)، ويرجع بعد ساعة.
-const WORLD = 30000, MAX_HP = 12, HIT_COOLDOWN = 1200, RESPAWN_MS = +process.env.BOSS_RESPAWN_MS || 3600000;
+const WORLD = 25000, MAX_HP = 12, HIT_COOLDOWN = 1200, RESPAWN_MS = +process.env.BOSS_RESPAWN_MS || 3600000;
 const REWARD = { final: 1000, xp: 2000, part: 150 };
 function fresh(now, rnd = Math.random) {
-  return { alive: true, hp: MAX_HP, max: MAX_HP, x: 3000 + rnd() * 24000, y: 3000 + rnd() * 24000, a: rnd() * Math.PI * 2, wa: 0, wu: 0, gr: 160, inv: 0, hitters: new Set(), respawnAt: 0, born: now };
+  return { alive: true, hp: MAX_HP, max: MAX_HP, x: 2500 + rnd() * 22000, y: 2500 + rnd() * 22000, a: rnd() * Math.PI * 2, wa: 0, wu: 0, gr: 160, inv: 0, hitters: new Set(), respawnAt: 0, born: now };
 }
 function tick(b, peers, now, rnd = Math.random) { // كل 50 ملي ثانية (= 3 فريمات)
   if (!b.alive) return false;

@@ -65,14 +65,15 @@ function chestGrant(cat, st, kind, amount, pick) { // صندوق نادر: عم�
   st.coins = (st.coins || 0) + amount; return { coins: amount };
 }
 const DAILY7 = [100, 150, 200, 300, 400, 600, 1500]; // مكافآت 7 أيام (اليوم 7 يعطي وسام وفاء حصري)
-function daily(st, now) {
-  if (st.gt && now < st.gt) throw bad('cooldown'); // نفس المنع القديم: مرة كل 24 ساعة (الوقت من السيرفر فقط)
-  st.sk = (st.dl && now - st.dl <= 2 * DAY) ? (st.sk || 0) + 1 : 1; // تفوت أكثر من يومين تبدأ من جديد
-  st.dl = now; st.gt = now + DAY;
-  const idx = (st.sk - 1) % 7, coins = DAILY7[idx]; let item = null;
+function daily(st, now, own) { // مكافأة يومية حسب التقويم (UTC): كل يوم مكافأة، وما تُعوّض لو فاتك يوم
+  const d = Math.floor(now / DAY), last = st.dl ? Math.floor(st.dl / DAY) : -1;
+  if (last === d) throw bad('cooldown');
+  st.sk = last === d - 1 ? (st.sk || 0) + 1 : 1; // سلسلة الأيام المتتالية (للإنجازات والإحصائيات فقط)
+  st.dl = now; st.gt = (d + 1) * DAY;
+  const cyc = ((d % 7) + 7) % 7, base = DAILY7[cyc], coins = own ? base * 2 : base; let item = null;
   st.coins = (st.coins || 0) + coins;
-  if (idx === 6) { st.gown = st.gown || ['🪦']; if (!st.gown.includes('🎖️')) { st.gown.push('🎖️'); item = '🎖️'; } }
-  return { coins, day: idx + 1, streak: st.sk, item, ach: checkAch(st, now) };
+  if (cyc === 6) { st.gown = st.gown || ['🪦']; if (!st.gown.includes('🎖️')) { st.gown.push('🎖️'); item = '🎖️'; } }
+  return { coins, day: cyc + 1, streak: st.sk, item, own: !!own, ach: checkAch(st, now) };
 }
 function spin(cat, st, now, r) {
   if (st.wt && now < st.wt) throw bad('cooldown');
@@ -137,6 +138,7 @@ function prefs(cat, st, b) {
   if (!b.fsk) st.fsk = ''; else if ((st.fown || []).includes(b.fsk)) st.fsk = b.fsk;
   if (typeof b.gsel === 'string' && (b.gsel === '🪦' || (b.gsel === 'vg' ? vipActive(st) : (st.gown || []).includes(b.gsel)))) st.gsel = b.gsel;
   if (Number.isInteger(b.ef) && (b.ef === 0 || (b.ef === cat.vipef ? vipActive(st) : (st.eo || []).includes(b.ef)))) st.ef = b.ef;
+  if (typeof b.pa === 'string' && (b.pa === '' || /^e([1-9]|1[0-2])$/.test(b.pa) || (/^\d{1,3}$/.test(b.pa) && (st.own || [0]).includes(+b.pa)))) st.pa = b.pa; // صورة الملف: إيموجي أو سكن تملكه
   if (Array.isArray(b.em) && b.em.length === 9 && b.em.every(n => Number.isInteger(n) && n >= 1 && n <= EMOJIS.length)) st.em = b.em.slice();
   if (typeof b.tt === 'string' && (b.tt === '' || (st.titles || []).includes(b.tt))) st.tt = b.tt;
   if (b.cc && typeof b.cc === 'object' && !Array.isArray(b.cc) && vipActive(st)) { // ألوان السكنات المعدّلة (للمميزين فقط، وتنحفظ)
@@ -178,5 +180,11 @@ function loadHashes(dirs) { // يقرأ hashes-500.txt وغيرها (الكمي�
   }
   return map;
 }
+// ===== قائمة الأصدقاء (محفوظة في حساب كل لاعب: fr = الأصدقاء، fi = الطلبات الواردة)
+const FR_MAX = 100, FQ_MAX = 50;
+function frRequest(st, from) { const fr = st.fr || (st.fr = []), fi = st.fi || (st.fi = []); if (fr.includes(from)) return 'already'; if (fi.includes(from)) return 'pending'; if (fi.length >= FQ_MAX) return 'full'; fi.push(from); return 'ok'; }
+function frAccept(st, other) { const fr = st.fr || (st.fr = []); st.fi = (st.fi || []).filter(x => x !== other); if (!fr.includes(other)) { if (fr.length >= FR_MAX) throw bad('full'); fr.push(other); } }
+function frDecline(st, other) { st.fi = (st.fi || []).filter(x => x !== other); }
+function frRemove(st, other) { st.fr = (st.fr || []).filter(x => x !== other); st.fi = (st.fi || []).filter(x => x !== other); }
 const EMOJIS = ["😀", "😂", "🤣", "😍", "😎", "😭", "😡", "🥳", "😱", "🤔", "👍", "👎", "👏", "🙏", "💪", "🔥", "⭐", "❤️", "💔", "💀", "👑", "🏆", "🎉", "🎁", "💰", "🪙", "⚡", "🌈", "☀️", "🌙", "🍎", "🍌", "🍇", "🍉", "🍔", "🍕", "🐍", "🐛", "🦖", "🐉", "👹", "👻", "🤖", "😈", "😇", "🤡", "🥶", "🥵", "😴", "🤯", "😏", "😜", "🤫", "🤝", "👋", "✌️", "🫡", "🫶", "💯", "✅", "❌", "⚠️", "🎯", "🚀", "🛡️", "🧲", "⚔️", "🔪", "💣", "🧨", "🏳️", "🇩🇿", "🇵🇸", "🇸🇦", "🇪🇬", "🇲🇦", "🇹🇳", "🇮🇶", "🤩", "😅"]; // إيموجي مرقّمة 1..80 (اكتب :12: في الدردشة)
-module.exports = { EMOJIS, statsOf, ACH, checkAch, weekOf, SEASON, seasonReward, grantSeason, kingPay, chestGrant, DAILY7, addHashModule, vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
+module.exports = { frRequest, frAccept, frDecline, frRemove, FR_MAX, EMOJIS, statsOf, ACH, checkAch, weekOf, SEASON, seasonReward, grantSeason, kingPay, chestGrant, DAILY7, addHashModule, vipActive, fixVip, grantAll, cleanPicks, normCode, hashCode, loadHashes, Bad, nd, lvOf, skinPrice, buy, daily, spin, runEnd, runBonus, runRevive, prefs, deliver, boostOf, DAY };
